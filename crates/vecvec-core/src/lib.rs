@@ -20,13 +20,19 @@
 pub mod distance;
 pub mod error;
 pub mod id;
+pub mod index;
 pub mod ordered;
 pub mod persist;
+pub mod vector;
 
 pub use distance::{DistanceKernel, Metric};
 pub use error::{CoreError, Result};
 pub use id::{GlobalId, LocalId, PointId, SegmentId, VersionId};
+pub use index::{
+    FilterContext, FlatIndex, Index, ScoredPoint, SearchParams, SoftDeleteSet, brute_force_topk,
+};
 pub use ordered::{OrderedF32, OrderedF64};
+pub use vector::VectorStorage;
 
 /// The crate version, surfaced so binaries can report a single source of truth.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
