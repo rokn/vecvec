@@ -17,11 +17,13 @@
 //! - [`persist::atomic`] — crash-safe atomic file writes (temp → fsync → rename →
 //!   fsync-dir) with magic + version + CRC framing.
 
+pub mod distance;
 pub mod error;
 pub mod id;
 pub mod ordered;
 pub mod persist;
 
+pub use distance::{DistanceKernel, Metric};
 pub use error::{CoreError, Result};
 pub use id::{GlobalId, LocalId, PointId, SegmentId, VersionId};
 pub use ordered::{OrderedF32, OrderedF64};

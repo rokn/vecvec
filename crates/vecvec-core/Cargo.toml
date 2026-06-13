@@ -6,10 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Pulls in `simsimd` as an independent reference for cross-checking the distance
+# kernels in tests. Off by default; enable with `--features oracle`.
+oracle = ["dep:simsimd"]
+
 [dependencies]
 thiserror.workspace = true
 crc32fast.workspace = true
 tempfile.workspace = true
+simsimd = { version = "6", optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
