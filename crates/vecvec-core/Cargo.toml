@@ -21,3 +21,12 @@ simsimd = { version = "6", optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "distance"
+harness = false
+
+[[bench]]
+name = "search"
+harness = false
