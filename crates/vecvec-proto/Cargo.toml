@@ -1,9 +1,15 @@
 [package]
 name = "vecvec-proto"
-description = "gRPC protocol definitions and generated stubs for vecvec (codegen lands in M3)."
+description = "gRPC protocol definitions and generated stubs for vecvec."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

@@ -1,6 +1,14 @@
 //! `vecvec-proto` — gRPC service/message definitions and the generated tonic/prost
-//! stubs, plus the wire ⇄ core conversion layer.
+//! stubs.
 //!
-//! This crate is an intentional placeholder at M0. The `.proto` files, the
-//! `build.rs` codegen (via `tonic-prost-build`), and `convert.rs` arrive in M3 when
-//! the first network-facing vertical slice is built.
+//! The generated code lives in [`pb`]. [`FILE_DESCRIPTOR_SET`] is the encoded
+//! protobuf descriptor used to power server reflection (`grpcurl`, Postman).
+
+/// Generated protobuf messages and tonic service stubs for `vecvec.v1`.
+pub mod pb {
+    tonic::include_proto!("vecvec.v1");
+}
+
+/// Encoded `FileDescriptorSet` for gRPC server reflection.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/vecvec_descriptor.bin"));

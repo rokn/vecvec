@@ -23,6 +23,18 @@ roaring = "0.10"
 arc-swap = "1"
 parking_lot = "0.12"
 
+# --- server / gRPC stack (M3+) ---
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-health = "0.14"
+tonic-reflection = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+dashmap = "6"
+rayon = "1"
+
 # --- dev/test ---
 tempfile = "3"
 proptest = "1"

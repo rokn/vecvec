@@ -6,9 +6,31 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "vecvec_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vecvec-server"
 path = "src/main.rs"
 
 [dependencies]
 vecvec-core.workspace = true
+vecvec-proto.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+tonic-reflection.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
+dashmap.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+vecvec-core.workspace = true
+vecvec-proto.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true

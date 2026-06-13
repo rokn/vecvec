@@ -5,8 +5,17 @@ versioning** of collections (immutable snapshots, time-travel query, branch, dif
 restore) on top of an HNSW index. See [BuildPlan.md](./BuildPlan.md) for the full
 architecture and milestone roadmap.
 
-> Status: **M0** — workspace scaffold and shared primitives. Not yet runnable as a server
-> (networking lands in M3).
+> Status: **M3** — runnable gRPC vertical slice. The server starts and serves
+> `Collections.Create`, `Points.Upsert` (client-streaming), and `Query.Query`, with
+> health + reflection. HNSW, durability, versioning, payload/filter, and REST land
+> in later milestones.
+
+Run it:
+
+```sh
+cargo run -p vecvec-server          # serves grpc://127.0.0.1:6334
+grpcurl -plaintext 127.0.0.1:6334 list
+```
 
 ## Development
 
