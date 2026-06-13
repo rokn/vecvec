@@ -21,6 +21,7 @@ thiserror = "2"
 crc32fast = "1.4"
 roaring = "0.10"
 arc-swap = "1"
+parking_lot = "0.12"
 
 # --- dev/test ---
 tempfile = "3"

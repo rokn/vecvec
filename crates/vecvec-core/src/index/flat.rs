@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use super::{BoundedTopK, Index, ScoredPoint, SearchParams, SoftDeleteSet};
+use super::{Index, ScoredPoint, SearchParams, SoftDeleteSet, scan_topk};
 use crate::distance::DistanceKernel;
 use crate::id::PointId;
 use crate::index::filter::FilterContext;
@@ -64,20 +64,14 @@ impl Index for FlatIndex {
         filter: Option<&dyn FilterContext>,
     ) -> Vec<ScoredPoint> {
         let tombstones = self.deleted.snapshot();
-        let higher = self.kernel.metric().higher_is_better();
-        let mut topk = BoundedTopK::new(k, higher);
-        for (id, v) in self.storage.iter() {
-            if tombstones.contains(id.get()) {
-                continue;
-            }
-            if let Some(f) = filter
-                && !f.matches(id)
-            {
-                continue;
-            }
-            topk.offer(id, self.kernel.score_f32(query, v));
-        }
-        topk.into_sorted_vec()
+        scan_topk(
+            &self.storage,
+            &self.kernel,
+            query,
+            k,
+            Some(&tombstones),
+            filter,
+        )
     }
 
     fn delete(&self, id: PointId) -> bool {

@@ -68,6 +68,15 @@ pub enum CoreError {
         /// A human-readable description of what was wrong.
         detail: String,
     },
+
+    /// A vector's length did not match the collection's configured dimensionality.
+    #[error("dimension mismatch: expected {expected}, got {got}")]
+    DimensionMismatch {
+        /// The collection's configured dimensionality.
+        expected: usize,
+        /// The dimensionality of the offending vector.
+        got: usize,
+    },
 }
 
 impl CoreError {

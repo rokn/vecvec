@@ -93,7 +93,7 @@ pub trait Index: Send + Sync {
 /// ascending sort works for all metrics, and the `id` tie-break makes top-k
 /// deterministic (so approximate indexes can be compared against the oracle).
 #[inline]
-fn rank_key(score: f32, id: PointId, higher_is_better: bool) -> (OrderedF32, PointId) {
+fn rank_key<I>(score: f32, id: I, higher_is_better: bool) -> (OrderedF32, I) {
     let badness = if higher_is_better { -score } else { score };
     (OrderedF32::new(badness), id)
 }
@@ -103,18 +103,22 @@ fn score_from_badness(badness: f32, higher_is_better: bool) -> f32 {
     if higher_is_better { -badness } else { badness }
 }
 
-/// A bounded top-k collector: keeps the `k` most-preferred `(score, id)` pairs seen
-/// so far in `O(log k)` per offer, with the same ordering as [`brute_force_topk`].
+/// A bounded top-k collector over ids of type `I`: keeps the `k` most-preferred
+/// `(score, id)` pairs seen so far in `O(log k)` per offer, with the same `(badness,
+/// id)` ordering as [`brute_force_topk`]. Generic over the id type so it serves both
+/// segment-local ([`PointId`]) results and the collection-global merge ([`GlobalId`]).
 ///
-/// Internally a max-heap keyed on [`rank_key`] whose root is the *worst* kept
-/// result, so a better incoming result evicts it.
-pub(crate) struct BoundedTopK {
+/// Internally a max-heap whose root is the *worst* kept result, so a better incoming
+/// result evicts it.
+///
+/// [`GlobalId`]: crate::id::GlobalId
+pub(crate) struct BoundedTopK<I: Copy + Ord> {
     k: usize,
     higher_is_better: bool,
-    heap: BinaryHeap<(OrderedF32, PointId)>,
+    heap: BinaryHeap<(OrderedF32, I)>,
 }
 
-impl BoundedTopK {
+impl<I: Copy + Ord> BoundedTopK<I> {
     pub(crate) fn new(k: usize, higher_is_better: bool) -> Self {
         Self {
             k,
@@ -124,7 +128,7 @@ impl BoundedTopK {
     }
 
     #[inline]
-    pub(crate) fn offer(&mut self, id: PointId, score: f32) {
+    pub(crate) fn offer(&mut self, id: I, score: f32) {
         if self.k == 0 {
             return;
         }
@@ -140,17 +144,47 @@ impl BoundedTopK {
         }
     }
 
-    pub(crate) fn into_sorted_vec(self) -> Vec<ScoredPoint> {
+    /// Drains into a best-first `(id, score)` vector.
+    pub(crate) fn into_sorted(self) -> Vec<(I, f32)> {
         let higher = self.higher_is_better;
-        let mut keys: Vec<(OrderedF32, PointId)> = self.heap.into_vec();
+        let mut keys: Vec<(OrderedF32, I)> = self.heap.into_vec();
         keys.sort_unstable(); // ascending (badness, id) == best-first
         keys.into_iter()
-            .map(|(b, id)| ScoredPoint {
-                id,
-                score: score_from_badness(b.into_inner(), higher),
-            })
+            .map(|(b, id)| (id, score_from_badness(b.into_inner(), higher)))
             .collect()
     }
+}
+
+/// Heap-based exact top-k scan over a [`VectorStorage`] — the shared, efficient
+/// (`O(n log k)`) search path used by [`FlatIndex`] and the appendable segment.
+/// `tombstones`/`filter` of `None` admit everything.
+pub(crate) fn scan_topk(
+    storage: &VectorStorage,
+    kernel: &DistanceKernel,
+    query: &[f32],
+    k: usize,
+    tombstones: Option<&roaring::RoaringBitmap>,
+    filter: Option<&dyn FilterContext>,
+) -> Vec<ScoredPoint> {
+    let higher = kernel.metric().higher_is_better();
+    let mut topk = BoundedTopK::<PointId>::new(k, higher);
+    for (id, v) in storage.iter() {
+        if let Some(t) = tombstones
+            && t.contains(id.get())
+        {
+            continue;
+        }
+        if let Some(f) = filter
+            && !f.matches(id)
+        {
+            continue;
+        }
+        topk.offer(id, kernel.score_f32(query, v));
+    }
+    topk.into_sorted()
+        .into_iter()
+        .map(|(id, score)| ScoredPoint { id, score })
+        .collect()
 }
 
 /// Exact top-k search by full scan — the reference implementation and test oracle.
