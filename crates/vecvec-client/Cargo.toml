@@ -1,0 +1,9 @@
+[package]
+name = "vecvec-client"
+description = "Reusable Rust client library for the vecvec server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

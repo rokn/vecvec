@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Nix / direnv
+/.direnv
+result
+result-*
+
+# Local server data directories
+/data
+*.vecvec-data
+
+# Editor/OS cruft
+.DS_Store

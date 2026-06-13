@@ -17,13 +17,12 @@
         pkgs = import nixpkgs { inherit system overlays; };
         inherit (pkgs) lib;
 
-        # Toolchain components shared by the stable and nightly shells.
+        # Components for the nightly (miri) shell; the stable shell reads its
+        # channel + components from ./rust-toolchain.toml (single source of truth).
         rustExtensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
 
-        # Default dev toolchain: latest stable Rust.
-        rustStable = pkgs.rust-bin.stable.latest.default.override {
-          extensions = rustExtensions;
-        };
+        # Default dev toolchain: exactly what rust-toolchain.toml pins.
+        rustStable = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
         # Nightly toolchain that ships `miri` — used for the unsafe-module UB
         # tests (mmap cast-and-go, flat link arenas, self-referential Segment).

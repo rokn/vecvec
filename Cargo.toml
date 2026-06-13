@@ -1,0 +1,36 @@
+# vecvec — workspace root.
+# See BuildPlan.md for the architecture and milestone roadmap.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# --- internal crates ---
+vecvec-core = { path = "crates/vecvec-core" }
+vecvec-proto = { path = "crates/vecvec-proto" }
+vecvec-client = { path = "crates/vecvec-client" }
+
+# --- external (grown per milestone; M0 keeps this minimal) ---
+thiserror = "2"
+crc32fast = "1.4"
+
+# --- dev/test ---
+tempfile = "3"
+proptest = "1"
+
+# Keep release builds fast and debuggable for a perf-sensitive DB.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+# A profile for benchmarks/perf work that keeps full debuginfo.
+[profile.bench]
+debug = true

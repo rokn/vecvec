@@ -1,0 +1,5 @@
+# Single source of truth for the pinned toolchain (read by both rustup and the
+# Nix flake's default dev shell via rust-bin.fromRustupToolchainFile).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
