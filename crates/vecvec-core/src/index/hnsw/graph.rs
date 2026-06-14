@@ -9,11 +9,8 @@
 
 use roaring::RoaringBitmap;
 
-use crate::distance::DistanceKernel;
 use crate::id::PointId;
-use crate::index::ScoredPoint;
 use crate::index::filter::FilterContext;
-use crate::vector::VectorStorage;
 
 use super::search::{Graph, search_layer};
 use super::visited::VisitedList;
@@ -61,35 +58,30 @@ impl GraphLayers {
         self.levels.len()
     }
 
-    /// Searches for the best `k` admitted points for `query` with beam width `ef`.
-    /// Points in `deleted` or rejected by `filter` are traversed (for connectivity)
-    /// but never returned.
+    /// Searches the graph using a caller-supplied **distance** closure (`dist(id)`
+    /// returns badness; smaller is closer), returning the best `k` admitted points
+    /// as `(badness, local_id)` best-first. The closure may compute f32 or quantized
+    /// distances. Points in `deleted` or rejected by `filter` are traversed (for
+    /// connectivity) but never returned.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn search(
+    pub(crate) fn search_ids<D: Fn(u32) -> f32>(
         &self,
-        vectors: &VectorStorage,
-        kernel: &DistanceKernel,
-        query: &[f32],
+        dist: &D,
         k: usize,
         ef: usize,
         filter: Option<&dyn FilterContext>,
         deleted: Option<&RoaringBitmap>,
         visited: &mut VisitedList,
-    ) -> Vec<ScoredPoint> {
+    ) -> Vec<(f32, u32)> {
         let Some(entry) = self.entry else {
             return Vec::new();
-        };
-        let higher = kernel.metric().higher_is_better();
-        let dist = |id: u32| {
-            let s = kernel.score_f32(query, vectors.get(PointId::new(id)));
-            if higher { -s } else { s }
         };
         let admit_all = |_: u32| true;
 
         // Greedy descent through the upper layers (beam width 1).
         let mut ep = vec![entry];
         for layer in (1..=self.max_level).rev() {
-            let w = search_layer(self, layer, &ep, 1, &dist, &admit_all, visited);
+            let w = search_layer(self, layer, &ep, 1, dist, &admit_all, visited);
             if let Some(&(_, best)) = w.first() {
                 ep = vec![best];
             }
@@ -109,13 +101,8 @@ impl GraphLayers {
             }
             true
         };
-        let w = search_layer(self, 0, &ep, ef, &dist, &admit, visited);
-        w.into_iter()
-            .take(k)
-            .map(|(b, id)| ScoredPoint {
-                id: PointId::new(id),
-                score: if higher { -b } else { b },
-            })
-            .collect()
+        let mut w = search_layer(self, 0, &ep, ef, dist, &admit, visited);
+        w.truncate(k);
+        w
     }
 }

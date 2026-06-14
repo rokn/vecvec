@@ -28,6 +28,8 @@ use super::{Index, ScoredPoint, SearchParams, SoftDeleteSet};
 use crate::distance::DistanceKernel;
 use crate::id::PointId;
 use crate::index::filter::FilterContext;
+use crate::ordered::OrderedF32;
+use crate::quantization::QuantizedVectorBlock;
 use crate::vector::VectorStorage;
 
 /// HNSW construction and search parameters. Defaults follow the values validated by
@@ -46,6 +48,14 @@ pub struct HnswConfig {
     pub seed: u64,
     /// Whether to top up pruned candidates to the degree bound (keepPrunedConnections).
     pub keep_pruned: bool,
+    /// Whether to store an int8-quantized copy and rank by quantized distance with
+    /// f32 rescore (~4× less memory; the f32 path is exact rescored).
+    #[serde(default = "default_quantization")]
+    pub quantization: bool,
+}
+
+fn default_quantization() -> bool {
+    true
 }
 
 impl Default for HnswConfig {
@@ -57,9 +67,13 @@ impl Default for HnswConfig {
             ef_search: 64,
             seed: 0x5EED_1234_5678_9ABC,
             keep_pruned: true,
+            quantization: true,
         }
     }
 }
+
+/// Candidate over-fetch factor for quantized search before f32 rescore.
+const RESCORE_OVERSAMPLE: usize = 4;
 
 impl HnswConfig {
     /// The level-distribution constant `mL = 1/ln(M)`.
@@ -74,6 +88,8 @@ pub struct HnswIndex {
     vectors: Arc<VectorStorage>,
     kernel: DistanceKernel,
     graph: GraphLayers,
+    /// Optional int8 copy for low-memory ranking (rescored with f32).
+    quantized: Option<QuantizedVectorBlock>,
     deleted: SoftDeleteSet,
     config: HnswConfig,
     pool: VisitedPool,
@@ -91,10 +107,14 @@ impl HnswIndex {
             builder.insert(id, &mut visited);
         }
         let graph = builder.into_graph_layers();
+        let quantized = config
+            .quantization
+            .then(|| QuantizedVectorBlock::build(&vectors));
         Self {
             vectors,
             kernel,
             graph,
+            quantized,
             deleted: SoftDeleteSet::new(),
             config,
             pool: VisitedPool::new(n.max(1)),
@@ -115,10 +135,14 @@ impl HnswIndex {
         for &local in deleted_locals {
             deleted.delete(PointId::new(local));
         }
+        let quantized = config
+            .quantization
+            .then(|| QuantizedVectorBlock::build(&vectors));
         Self {
             vectors,
             kernel,
             graph,
+            quantized,
             deleted,
             config,
             pool: VisitedPool::new(n.max(1)),
@@ -159,20 +183,55 @@ impl Index for HnswIndex {
         }
         // Enforce ef >= k (and honor an explicit override / the config default).
         let ef = params.ef.max(self.config.ef_search).max(k);
+        let higher = self.kernel.metric().higher_is_better();
         let deleted = self.deleted.snapshot();
         let mut visited = self.pool.get();
-        let results = self.graph.search(
-            &self.vectors,
-            &self.kernel,
-            query,
-            k,
-            ef,
-            filter,
-            Some(&deleted),
-            &mut visited,
-        );
+
+        let candidates = if let Some(qb) = &self.quantized {
+            // Rank by quantized distance over an over-fetched beam, then rescore.
+            let quantized_query = qb.quantizer().encode(query);
+            let dist = |id: u32| qb.badness(&quantized_query, id);
+            let fetch = (k * RESCORE_OVERSAMPLE).max(k);
+            self.graph.search_ids(
+                &dist,
+                fetch,
+                ef.max(fetch),
+                filter,
+                Some(&deleted),
+                &mut visited,
+            )
+        } else {
+            let dist = |id: u32| {
+                let s = self
+                    .kernel
+                    .score_f32(query, self.vectors.get(PointId::new(id)));
+                if higher { -s } else { s }
+            };
+            self.graph
+                .search_ids(&dist, k, ef, filter, Some(&deleted), &mut visited)
+        };
         self.pool.put(visited);
-        results
+
+        // Rescore candidates with the exact f32 kernel and take the true top-k.
+        let mut scored: Vec<(OrderedF32, ScoredPoint)> = candidates
+            .into_iter()
+            .map(|(_, id)| {
+                let score = self
+                    .kernel
+                    .score_f32(query, self.vectors.get(PointId::new(id)));
+                let badness = if higher { -score } else { score };
+                (
+                    OrderedF32::new(badness),
+                    ScoredPoint {
+                        id: PointId::new(id),
+                        score,
+                    },
+                )
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
+        scored.truncate(k);
+        scored.into_iter().map(|(_, sp)| sp).collect()
     }
 
     fn delete(&self, id: PointId) -> bool {

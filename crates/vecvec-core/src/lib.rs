@@ -25,6 +25,7 @@ pub mod id;
 pub mod index;
 pub mod ordered;
 pub mod persist;
+pub mod quantization;
 pub mod segment;
 pub mod vector;
 pub mod version;

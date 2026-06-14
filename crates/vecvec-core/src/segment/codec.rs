@@ -122,6 +122,7 @@ pub(crate) fn decode_segment(id: SegmentId, bytes: &[u8]) -> Result<SealedSegmen
         ef_search: data.ef_search as usize,
         seed: data.seed,
         keep_pruned: data.keep_pruned,
+        quantization: true,
     };
     let graph = GraphLayers {
         entry: data.entry,
