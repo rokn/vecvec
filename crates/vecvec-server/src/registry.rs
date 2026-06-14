@@ -42,6 +42,19 @@ impl Registry {
         self.collections.iter().map(|e| e.value().clone()).collect()
     }
 
+    /// A snapshot of all `(name, collection)` pairs (for listing in the explorer UI).
+    pub fn list_all(&self) -> Vec<(String, Arc<DurableCollection>)> {
+        self.collections
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect()
+    }
+
+    /// Removes a collection from the registry, returning it if it was present.
+    pub fn remove(&self, name: &str) -> Option<Arc<DurableCollection>> {
+        self.collections.remove(name).map(|(_, v)| v)
+    }
+
     /// The number of collections.
     pub fn len(&self) -> usize {
         self.collections.len()

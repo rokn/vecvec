@@ -70,6 +70,18 @@ pub struct ScoredGlobal {
     pub score: f32,
 }
 
+/// A full materialized point: its id, f32 vector, and optional payload. Returned by
+/// the explorer scroll / point-fetch APIs (the UI's table + 2D graph view).
+#[derive(Debug, Clone)]
+pub struct PointRecord {
+    /// The collection-global point id.
+    pub id: GlobalId,
+    /// The stored (normalized for cosine) f32 vector.
+    pub vector: Vec<f32>,
+    /// The point's JSON payload, if any.
+    pub payload: Option<Payload>,
+}
+
 /// A collection of vectors served from RAM, with a git-like version DAG.
 pub struct Collection {
     config: CollectionConfig,
@@ -387,6 +399,96 @@ impl Collection {
             .load()
             .iter()
             .find_map(|s| s.vector_of(global).map(<[f32]>::to_vec))
+    }
+
+    /// A full live point (vector + payload) by id, or `None` if missing or tombstoned.
+    pub fn get_point(&self, global: GlobalId) -> Option<PointRecord> {
+        if self.working_deletions.load().contains(global) {
+            return None;
+        }
+        let vector = self.get_vector(global)?;
+        let payload = self.payloads.read().get(&global.get()).cloned();
+        Some(PointRecord {
+            id: global,
+            vector,
+            payload,
+        })
+    }
+
+    /// Materializes a page of live points — every row across the working sealed set
+    /// and the appendable segment, minus tombstones, joined with payloads and ordered
+    /// by ascending global id. With `at`, reads as of a past version (its frozen
+    /// segment set + deletion vector). Returns `(page, total_live_count)`.
+    ///
+    /// This is the read path behind the explorer table and the 2D graph view, which
+    /// need the raw vectors that search (`{id, score}` only) does not surface.
+    pub fn scroll(
+        &self,
+        at: Option<&VersionSelector>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<PointRecord>, usize)> {
+        let payloads = self.payloads.read();
+        let mut rows: Vec<(GlobalId, Vec<f32>)> = Vec::new();
+
+        match at {
+            None => {
+                let deletions = self.working_deletions.load_full();
+                for seg in self.working.load_full().iter() {
+                    for (id, v) in seg.iter_points() {
+                        if !deletions.contains(id) {
+                            rows.push((id, v.to_vec()));
+                        }
+                    }
+                }
+                let app = self.appendable.read();
+                for (id, v) in app.iter_points() {
+                    if !deletions.contains(id) {
+                        rows.push((id, v.to_vec()));
+                    }
+                }
+            }
+            Some(selector) => {
+                let (segment_ids, deletions) = {
+                    let versions = self.versions.lock();
+                    let version =
+                        versions
+                            .resolve(selector)
+                            .ok_or_else(|| CoreError::Version {
+                                detail: format!("unresolved selector {selector:?}"),
+                            })?;
+                    let manifest = versions.get(version).expect("resolved version exists");
+                    (
+                        manifest.segments.iter().map(|s| s.id).collect::<Vec<u64>>(),
+                        manifest.deletions.clone(),
+                    )
+                };
+                let all = self.all_segments.read();
+                for sid in segment_ids {
+                    if let Some(seg) = all.get(&SegmentId::new(sid)) {
+                        for (id, v) in seg.iter_points() {
+                            if !deletions.contains(id) {
+                                rows.push((id, v.to_vec()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        rows.sort_by_key(|(g, _)| g.get());
+        let total = rows.len();
+        let page = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(id, vector)| PointRecord {
+                payload: payloads.get(&id.get()).cloned(),
+                id,
+                vector,
+            })
+            .collect();
+        Ok((page, total))
     }
 
     /// Recommend-by-example: builds a query vector `mean(positives) - mean(negatives)`
