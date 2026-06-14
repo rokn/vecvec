@@ -8,8 +8,25 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use super::deletion::DeletionVector;
 use super::manifest::{Manifest, SegmentRef};
+
+/// A serializable snapshot of a [`VersionStore`] for durable persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionStoreSnapshot {
+    /// All committed manifests.
+    pub manifests: Vec<Manifest>,
+    /// The current `HEAD`.
+    pub head: Option<u64>,
+    /// Branch pointers.
+    pub branches: HashMap<String, u64>,
+    /// Tag pointers.
+    pub tags: HashMap<String, u64>,
+    /// The next version id to allocate.
+    pub next_version: u64,
+}
 
 /// Selects a version to read: an explicit id, a tag, a branch head, or `HEAD`.
 #[derive(Debug, Clone)]
@@ -111,6 +128,42 @@ impl VersionStore {
             self.tags.insert(name, version);
         }
         manifest
+    }
+
+    /// A serializable snapshot of the whole store.
+    pub fn snapshot(&self) -> VersionStoreSnapshot {
+        VersionStoreSnapshot {
+            manifests: self.commits.values().map(|m| (**m).clone()).collect(),
+            head: self.head,
+            branches: self.branches.clone(),
+            tags: self.tags.clone(),
+            next_version: self.next_version,
+        }
+    }
+
+    /// Rebuilds a store from a snapshot (recovery).
+    pub fn from_snapshot(snapshot: VersionStoreSnapshot) -> Self {
+        let commits = snapshot
+            .manifests
+            .into_iter()
+            .map(|m| (m.version, Arc::new(m)))
+            .collect();
+        Self {
+            commits,
+            head: snapshot.head,
+            branches: snapshot.branches,
+            tags: snapshot.tags,
+            next_version: snapshot.next_version,
+        }
+    }
+
+    /// All segment ids referenced by any retained version.
+    pub fn all_referenced_segments(&self) -> BTreeSet<u64> {
+        let mut ids = BTreeSet::new();
+        for m in self.commits.values() {
+            ids.extend(m.segment_ids());
+        }
+        ids
     }
 
     /// The current `HEAD` version, if any commits exist.

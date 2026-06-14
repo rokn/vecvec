@@ -67,11 +67,16 @@ pub enum FsyncMode {
     Async,
 }
 
+const VERSIONS_FILE: &str = "versions";
+
 /// The persisted pointer to the latest durable state.
 #[derive(Debug, Serialize, Deserialize)]
 struct CheckpointHead {
     wal_generation: u64,
-    sealed_ids: Vec<u64>,
+    /// Segments forming the live working set as of the checkpoint.
+    working_segment_ids: Vec<u64>,
+    /// All segments to load on recovery (working set + everything any version refs).
+    all_segment_ids: Vec<u64>,
     next_global_id: u64,
     next_segment_id: u64,
     #[serde(default)]
@@ -92,6 +97,8 @@ pub struct DurableCollection {
     fsync: FsyncMode,
     trigger: Mutex<crate::version::TriggerEvaluator>,
     clock: crate::version::SystemClock,
+    /// Segment ids already written to disk (so commits don't rewrite them).
+    persisted_segments: Mutex<std::collections::HashSet<SegmentId>>,
 }
 
 impl DurableCollection {
@@ -105,23 +112,52 @@ impl DurableCollection {
         let collection = Arc::new(Collection::create(config));
         let clock = crate::version::SystemClock;
 
+        // Recover the durable version DAG (if any), so time-travel survives restart.
+        let versions_path = dir.join(VERSIONS_FILE);
+        let mut referenced: std::collections::BTreeSet<u64> = Default::default();
+        if versions_path.exists() {
+            let frame = read_framed(&versions_path)?;
+            let snapshot: crate::version::VersionStoreSnapshot =
+                rmp_serde::from_slice(&frame.payload).map_err(|e| CoreError::Serialization {
+                    detail: e.to_string(),
+                })?;
+            for m in &snapshot.manifests {
+                referenced.extend(m.segment_ids());
+            }
+            collection.load_version_snapshot(snapshot);
+        }
+
         // Recover the checkpoint, if any.
         let head_path = dir.join("HEAD");
+        let mut persisted = std::collections::HashSet::new();
         let generation = if head_path.exists() {
             let frame = read_framed(&head_path)?;
             let head: CheckpointHead =
                 rmp_serde::from_slice(&frame.payload).map_err(|e| CoreError::Serialization {
                     detail: e.to_string(),
                 })?;
-            let mut segments = Vec::with_capacity(head.sealed_ids.len());
-            for id in &head.sealed_ids {
+            // Load the working set + every segment referenced by any version.
+            let mut all_ids: std::collections::BTreeSet<u64> =
+                head.all_segment_ids.iter().copied().collect();
+            all_ids.extend(head.working_segment_ids.iter().copied());
+            all_ids.extend(referenced.iter().copied());
+            let mut segments = Vec::with_capacity(all_ids.len());
+            for id in &all_ids {
                 segments.push(store.load(SegmentId::new(*id))?);
+                persisted.insert(SegmentId::new(*id));
             }
-            collection.install_sealed(segments);
+            collection.install_recovered(segments, &head.working_segment_ids);
             collection.set_allocators(head.next_global_id, head.next_segment_id);
             collection.set_deletions(head.deletions);
             head.wal_generation
         } else {
+            // No checkpoint, but versions may still reference persisted segments.
+            let mut segments = Vec::new();
+            for id in &referenced {
+                segments.push(store.load(SegmentId::new(*id))?);
+                persisted.insert(SegmentId::new(*id));
+            }
+            collection.install_recovered(segments, &[]);
             0
         };
 
@@ -139,7 +175,28 @@ impl DurableCollection {
             fsync,
             trigger: Mutex::new(crate::version::TriggerEvaluator::new(policy, &clock)),
             clock,
+            persisted_segments: Mutex::new(persisted),
         })
+    }
+
+    /// Durably persists the version DAG and any segments it (or the working set)
+    /// references but that aren't yet on disk. Called after every commit so versions
+    /// survive a crash.
+    fn persist_versions(&self) -> Result<()> {
+        for id in self.collection.segment_ids_to_persist() {
+            if self.persisted_segments.lock().contains(&id) {
+                continue;
+            }
+            if let Some(seg) = self.collection.get_segment(id) {
+                self.store.write_sealed(&seg)?;
+                self.persisted_segments.lock().insert(id);
+            }
+        }
+        let snapshot = self.collection.version_snapshot();
+        let bytes = rmp_serde::to_vec(&snapshot).map_err(|e| CoreError::Serialization {
+            detail: e.to_string(),
+        })?;
+        write_atomic(&self.dir.join(VERSIONS_FILE), FileKind::Manifest, 1, &bytes)
     }
 
     fn wal_path(dir: &Path, generation: u64) -> PathBuf {
@@ -199,18 +256,28 @@ impl DurableCollection {
         drop(guard);
 
         // Auto-commit if the versioning policy's trigger has fired.
-        let mut trigger = self.trigger.lock();
-        trigger.record_writes(ids.len() as u64);
-        if trigger.should_commit(&self.clock) {
-            self.collection.commit("auto", None, None)?;
-            trigger.note_commit(&self.clock);
+        let committed = {
+            let mut trigger = self.trigger.lock();
+            trigger.record_writes(ids.len() as u64);
+            if trigger.should_commit(&self.clock) {
+                self.collection.commit("auto", None, None)?;
+                trigger.note_commit(&self.clock);
+                true
+            } else {
+                false
+            }
+        };
+        if committed {
+            self.persist_versions()?;
         }
         Ok(ids)
     }
 
     /// Explicitly commits the working state as a new version.
     pub fn commit(&self, message: Option<String>, tag: Option<String>) -> Result<u64> {
-        self.collection.commit("manual", message, tag)
+        let version = self.collection.commit("manual", message, tag)?;
+        self.persist_versions()?;
+        Ok(version)
     }
 
     /// Time-travel search as of a version/tag/branch.
@@ -231,17 +298,21 @@ impl DurableCollection {
 
     /// Restores the working state to a version (a forward commit).
     pub fn restore(&self, version: u64) -> Result<u64> {
-        self.collection.restore(version)
+        let new_version = self.collection.restore(version)?;
+        self.persist_versions()?;
+        Ok(new_version)
     }
 
     /// Tags a version.
     pub fn create_tag(&self, name: impl Into<String>, version: u64) -> Result<()> {
-        self.collection.create_tag(name, version)
+        self.collection.create_tag(name, version)?;
+        self.persist_versions()
     }
 
     /// Branches from a version.
     pub fn create_branch(&self, name: impl Into<String>, version: u64) -> Result<()> {
-        self.collection.create_branch(name, version)
+        self.collection.create_branch(name, version)?;
+        self.persist_versions()
     }
 
     /// All committed versions, oldest first.
@@ -279,12 +350,15 @@ impl DurableCollection {
         // 1. Seal the appendable into the sealed set (in memory).
         self.collection.seal();
 
-        // 2. Persist every sealed segment durably.
-        let sealed = self.collection.sealed_snapshot();
-        let mut sealed_ids = Vec::new();
-        for seg in sealed.iter() {
-            self.store.write_sealed(seg)?;
-            sealed_ids.push(seg.id().get());
+        // 2. Persist every segment the working set OR any version references.
+        let working_segment_ids = self.collection.working_segment_ids();
+        let mut all_segment_ids = Vec::new();
+        for id in self.collection.segment_ids_to_persist() {
+            if let Some(seg) = self.collection.get_segment(id) {
+                self.store.write_sealed(&seg)?;
+                self.persisted_segments.lock().insert(id);
+                all_segment_ids.push(id.get());
+            }
         }
 
         // 3. Create the next (empty) WAL generation, then commit HEAD atomically.
@@ -292,7 +366,8 @@ impl DurableCollection {
         let new_wal = Wal::open(Self::wal_path(&self.dir, new_generation))?;
         let head = CheckpointHead {
             wal_generation: new_generation,
-            sealed_ids,
+            working_segment_ids,
+            all_segment_ids,
             next_global_id: self.collection.next_global_id_value(),
             next_segment_id: self.collection.next_segment_id_value(),
             deletions: DeletionVector::clone(&self.collection.deletions_snapshot()),
@@ -361,6 +436,33 @@ mod tests {
         let got = dc.search(&q, 20, None).unwrap();
         assert_eq!(got.len(), 20);
         assert!(got.iter().any(|s| s.id.get() == first_id));
+    }
+
+    #[test]
+    fn versions_and_time_travel_survive_restart() {
+        use crate::version::VersionSelector;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Cosine);
+        let v1;
+        {
+            let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
+            dc.upsert((0..30).map(|i| vecf(8, i)).collect()).unwrap();
+            v1 = dc.commit(Some("first".into()), None).unwrap();
+            // delete some after the commit, then add more
+            dc.delete(2).unwrap();
+            dc.delete(3).unwrap();
+            assert_eq!(dc.len(), 28);
+            // crash (drop) — note: NO checkpoint, only commit + WAL
+        }
+        // Reopen: versions (and their segments) recovered from disk.
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+        assert_eq!(dc.list_versions().len(), 1);
+        assert_eq!(dc.len(), 28); // live reflects the deletes (replayed from WAL)
+        // Time-travel to v1 still sees all 30 (snapshot isolation across restart).
+        let at_v1 = dc
+            .search_at(&VersionSelector::Version(v1), &vecf(8, 1), 40, None)
+            .unwrap();
+        assert_eq!(at_v1.len(), 30);
     }
 
     #[test]

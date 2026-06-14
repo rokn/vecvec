@@ -393,16 +393,50 @@ impl Collection {
         self.working_deletions.load_full()
     }
 
-    /// Installs a recovered set of sealed segments into both the master registry and
-    /// the working set.
-    pub(crate) fn install_sealed(&self, segments: Vec<Arc<SealedSegment>>) {
-        let mut all = self.all_segments.write();
-        for seg in &segments {
-            all.insert(seg.id(), seg.clone());
+    /// Installs recovered segments: `all` go into the master registry (so any past
+    /// version is queryable), and those in `working_ids` form the live working set.
+    pub(crate) fn install_recovered(&self, all: Vec<Arc<SealedSegment>>, working_ids: &[u64]) {
+        let working_set: HashSet<u64> = working_ids.iter().copied().collect();
+        let mut map = self.all_segments.write();
+        for seg in &all {
+            map.insert(seg.id(), seg.clone());
         }
-        drop(all);
+        drop(map);
+        let working: Vec<Arc<SealedSegment>> = all
+            .into_iter()
+            .filter(|s| working_set.contains(&s.id().get()))
+            .collect();
         self.working
-            .store(Arc::new(SegmentSet::from_sealed(segments)));
+            .store(Arc::new(SegmentSet::from_sealed(working)));
+    }
+
+    /// A serializable snapshot of the version DAG (for durable persistence).
+    pub fn version_snapshot(&self) -> crate::version::VersionStoreSnapshot {
+        self.versions.lock().snapshot()
+    }
+
+    /// Loads a persisted version DAG (recovery).
+    pub(crate) fn load_version_snapshot(&self, snapshot: crate::version::VersionStoreSnapshot) {
+        *self.versions.lock() = VersionStore::from_snapshot(snapshot);
+    }
+
+    /// A sealed segment by id (from the master registry).
+    pub(crate) fn get_segment(&self, id: SegmentId) -> Option<Arc<SealedSegment>> {
+        self.all_segments.read().get(&id).cloned()
+    }
+
+    /// All segment ids that must be persisted to keep every version queryable: the
+    /// working set plus everything referenced by any committed version.
+    pub fn segment_ids_to_persist(&self) -> Vec<SegmentId> {
+        let mut ids: std::collections::BTreeSet<u64> =
+            self.working.load().iter().map(|s| s.id().get()).collect();
+        ids.extend(self.versions.lock().all_referenced_segments());
+        ids.into_iter().map(SegmentId::new).collect()
+    }
+
+    /// The ids of the live working set segments.
+    pub fn working_segment_ids(&self) -> Vec<u64> {
+        self.working.load().iter().map(|s| s.id().get()).collect()
     }
 
     /// Sets the live deletion vector (recovery).

@@ -9,7 +9,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use std::sync::Arc as StdArc;
+
 use vecvec_core::durable::read_config;
+use vecvec_core::version::{Manifest, VersionSelector};
 use vecvec_core::{CollectionConfig, DurableCollection, FsyncMode, Metric};
 
 use crate::blocking::{BlockingBridge, BridgeError};
@@ -129,22 +132,101 @@ impl Service {
         Ok(ids)
     }
 
-    /// Returns the best `k` matches for `query` in a collection.
+    /// Returns the best `k` matches for `query`, optionally as of a past version
+    /// (`at`) for a time-travel query.
     pub async fn query(
         &self,
         collection: String,
         query: Vec<f32>,
         k: usize,
+        at: Option<VersionSelector>,
     ) -> Result<Vec<(u64, f32)>, ServiceError> {
         let durable = self
             .registry
             .get(&collection)
             .ok_or(ServiceError::NotFound(collection))?;
-        let col = durable.collection().clone();
         let results = self
             .bridge
-            .run(move || col.search(&query, k, None))
+            .run(move || match at {
+                Some(selector) => durable.search_at(&selector, &query, k, None),
+                None => durable.search(&query, k, None),
+            })
             .await??;
         Ok(results.into_iter().map(|s| (s.id.get(), s.score)).collect())
+    }
+
+    fn get(&self, collection: &str) -> Result<StdArc<DurableCollection>, ServiceError> {
+        self.registry
+            .get(collection)
+            .ok_or_else(|| ServiceError::NotFound(collection.to_owned()))
+    }
+
+    /// Commits the working state of a collection as a new version.
+    pub async fn commit(
+        &self,
+        collection: String,
+        message: Option<String>,
+        tag: Option<String>,
+    ) -> Result<u64, ServiceError> {
+        let durable = self.get(&collection)?;
+        Ok(self
+            .bridge
+            .run(move || durable.commit(message, tag))
+            .await??)
+    }
+
+    /// Restores a collection's working state to a version (a forward commit).
+    pub async fn restore(&self, collection: String, version: u64) -> Result<u64, ServiceError> {
+        let durable = self.get(&collection)?;
+        Ok(self.bridge.run(move || durable.restore(version)).await??)
+    }
+
+    /// Tags a version.
+    pub async fn create_tag(
+        &self,
+        collection: String,
+        name: String,
+        version: u64,
+    ) -> Result<(), ServiceError> {
+        let durable = self.get(&collection)?;
+        self.bridge
+            .run(move || durable.create_tag(name, version))
+            .await??;
+        Ok(())
+    }
+
+    /// Branches from a version.
+    pub async fn create_branch(
+        &self,
+        collection: String,
+        name: String,
+        version: u64,
+    ) -> Result<(), ServiceError> {
+        let durable = self.get(&collection)?;
+        self.bridge
+            .run(move || durable.create_branch(name, version))
+            .await??;
+        Ok(())
+    }
+
+    /// Lists a collection's versions (and its current HEAD).
+    pub fn list_versions(
+        &self,
+        collection: &str,
+    ) -> Result<(Vec<StdArc<Manifest>>, Option<u64>), ServiceError> {
+        let durable = self.get(collection)?;
+        Ok((durable.list_versions(), durable.collection().head_version()))
+    }
+
+    /// Diffs two versions, returning (added, removed) global ids.
+    pub fn diff(
+        &self,
+        collection: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<(Vec<u64>, Vec<u64>), ServiceError> {
+        let durable = self.get(collection)?;
+        let diff = durable.diff(from, to)?;
+        Ok((diff.added, diff.removed))
     }
 }

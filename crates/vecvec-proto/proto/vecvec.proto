@@ -51,10 +51,21 @@ service Points {
 
 // ---- Query ----
 
+// Selects a version to read for time-travel; absent = the live HEAD.
+message VersionRef {
+  oneof selector {
+    uint64 version = 1;
+    string tag = 2;
+    string branch = 3;
+  }
+}
+
 message QueryRequest {
   string collection = 1;
   repeated float vector = 2;
   uint32 k = 3;
+  // Time-travel: read as of this version/tag/branch. Absent = live.
+  optional VersionRef at = 4;
 }
 
 message ScoredPoint {
@@ -68,4 +79,76 @@ message QueryResponse {
 
 service Query {
   rpc Query(QueryRequest) returns (QueryResponse);
+}
+
+// ---- Versioning (the differentiator) ----
+
+message ListVersionsRequest {
+  string collection = 1;
+}
+
+message VersionInfo {
+  uint64 version = 1;
+  optional uint64 parent = 2;
+  uint64 created_at_ms = 3;
+  string trigger = 4;
+  optional string message = 5;
+}
+
+message ListVersionsResponse {
+  repeated VersionInfo versions = 1;
+  optional uint64 head = 2;
+}
+
+message CommitRequest {
+  string collection = 1;
+  optional string message = 2;
+  optional string tag = 3;
+}
+
+message CommitResponse {
+  uint64 version = 1;
+}
+
+message TagRequest {
+  string collection = 1;
+  string name = 2;
+  uint64 version = 3;
+}
+
+message BranchRequest {
+  string collection = 1;
+  string name = 2;
+  uint64 version = 3;
+}
+
+message RefResponse {}
+
+message DiffRequest {
+  string collection = 1;
+  uint64 from = 2;
+  uint64 to = 3;
+}
+
+message DiffResponse {
+  repeated uint64 added = 1;
+  repeated uint64 removed = 2;
+}
+
+message RestoreRequest {
+  string collection = 1;
+  uint64 version = 2;
+}
+
+message RestoreResponse {
+  uint64 version = 1;
+}
+
+service Versioning {
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  rpc CreateTag(TagRequest) returns (RefResponse);
+  rpc CreateBranch(BranchRequest) returns (RefResponse);
+  rpc Diff(DiffRequest) returns (DiffResponse);
+  rpc Restore(RestoreRequest) returns (RestoreResponse);
 }

@@ -16,4 +16,7 @@ pub mod store;
 pub use deletion::DeletionVector;
 pub use manifest::{Manifest, SegmentRef};
 pub use policy::{Clock, SystemClock, TriggerEvaluator, VersioningPolicy};
-pub use store::{Diff, GcReport, RetentionRules, VersionError, VersionSelector, VersionStore};
+pub use store::{
+    Diff, GcReport, RetentionRules, VersionError, VersionSelector, VersionStore,
+    VersionStoreSnapshot,
+};

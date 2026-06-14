@@ -21,6 +21,7 @@ use tonic::transport::Server;
 use vecvec_proto::pb::collections_server::CollectionsServer;
 use vecvec_proto::pb::points_server::PointsServer;
 use vecvec_proto::pb::query_server::QueryServer;
+use vecvec_proto::pb::versioning_server::VersioningServer;
 
 use crate::grpc::Api;
 
@@ -38,6 +39,7 @@ pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), B
         .await;
     health_reporter.set_serving::<PointsServer<Api>>().await;
     health_reporter.set_serving::<QueryServer<Api>>().await;
+    health_reporter.set_serving::<VersioningServer<Api>>().await;
 
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(vecvec_proto::FILE_DESCRIPTOR_SET)
@@ -49,7 +51,8 @@ pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), B
         .add_service(reflection)
         .add_service(CollectionsServer::new(api.clone()))
         .add_service(PointsServer::new(api.clone()))
-        .add_service(QueryServer::new(api))
+        .add_service(QueryServer::new(api.clone()))
+        .add_service(VersioningServer::new(api))
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
