@@ -13,12 +13,14 @@
 pub mod deleted;
 pub mod filter;
 pub mod flat;
+pub mod hnsw;
 
 use std::collections::BinaryHeap;
 
 pub use deleted::{REBUILD_DELETED_RATIO, SoftDeleteSet};
 pub use filter::{AllowAll, BitmapFilter, CardinalityEstimate, FilterContext};
 pub use flat::FlatIndex;
+pub use hnsw::{HnswConfig, HnswIndex};
 
 use crate::distance::DistanceKernel;
 use crate::id::PointId;

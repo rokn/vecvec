@@ -32,7 +32,8 @@ pub use distance::{DistanceKernel, Metric};
 pub use error::{CoreError, Result};
 pub use id::{GlobalId, LocalId, PointId, SegmentId, VersionId};
 pub use index::{
-    FilterContext, FlatIndex, Index, ScoredPoint, SearchParams, SoftDeleteSet, brute_force_topk,
+    FilterContext, FlatIndex, HnswConfig, HnswIndex, Index, ScoredPoint, SearchParams,
+    SoftDeleteSet, brute_force_topk,
 };
 pub use ordered::{OrderedF32, OrderedF64};
 pub use segment::{AppendableSegment, SealedSegment, SegmentSet};
