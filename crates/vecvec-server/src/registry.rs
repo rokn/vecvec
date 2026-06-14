@@ -37,6 +37,11 @@ impl Registry {
         }
     }
 
+    /// A snapshot of all collections (for background maintenance).
+    pub fn snapshot(&self) -> Vec<Arc<DurableCollection>> {
+        self.collections.iter().map(|e| e.value().clone()).collect()
+    }
+
     /// The number of collections.
     pub fn len(&self) -> usize {
         self.collections.len()

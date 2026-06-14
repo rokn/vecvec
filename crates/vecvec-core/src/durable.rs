@@ -325,6 +325,27 @@ impl DurableCollection {
         self.collection.list_versions()
     }
 
+    /// Merges working segments to cut fan-out, then checkpoints to persist the new
+    /// working set. Returns the merged segment id (if any).
+    pub fn compact(&self) -> Result<Option<u64>> {
+        let merged = self.collection.compact().map(|id| id.get());
+        if merged.is_some() {
+            self.checkpoint()?;
+        }
+        Ok(merged)
+    }
+
+    /// Runs a GC pass with the given retention, deleting orphaned segment files.
+    pub fn gc(&self, retention: &crate::version::RetentionRules) -> Result<Vec<u64>> {
+        let dropped = self.collection.gc(retention);
+        for id in &dropped {
+            self.store.remove(*id);
+            self.persisted_segments.lock().remove(id);
+        }
+        self.persist_versions()?;
+        Ok(dropped.iter().map(|s| s.get()).collect())
+    }
+
     /// Durably tombstones a point. Returns whether it was newly deleted.
     pub fn delete(&self, id: u64) -> Result<bool> {
         let mut guard = self.wal.lock();

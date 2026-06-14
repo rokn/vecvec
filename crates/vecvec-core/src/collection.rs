@@ -28,8 +28,8 @@ use crate::payload::{Filter, FilterQuery, Payload, PayloadMap};
 use crate::segment::{AppendableSegment, SealedSegment, SegmentSet};
 use crate::version::policy::Clock;
 use crate::version::{
-    DeletionVector, Diff, Manifest, SegmentRef, SystemClock, VersionSelector, VersionStore,
-    VersioningPolicy,
+    DeletionVector, Diff, Manifest, RetentionRules, SegmentRef, SystemClock, VersionSelector,
+    VersionStore, VersioningPolicy,
 };
 
 /// Static configuration of a collection.
@@ -378,6 +378,54 @@ impl Collection {
         self.commit("restore", Some(format!("restore of v{version}")), None)
     }
 
+    /// Merges all working sealed segments into one, cutting search fan-out. The old
+    /// segments stay in the master registry (so versions referencing them remain
+    /// queryable) until GC. Returns the merged segment id, or `None` if there was
+    /// nothing to merge.
+    ///
+    /// Assumes the working segments form one contiguous global-id range (true unless
+    /// a prior restore re-pointed at a non-contiguous subset).
+    pub fn compact(&self) -> Option<SegmentId> {
+        let working = self.working.load_full();
+        if working.len() <= 1 {
+            return None;
+        }
+        let mut points: Vec<(GlobalId, Vec<f32>)> = Vec::new();
+        for seg in working.iter() {
+            for (g, v) in seg.iter_points() {
+                points.push((g, v.to_vec()));
+            }
+        }
+        points.sort_by_key(|(g, _)| g.get());
+
+        let seg_id = SegmentId::new(self.next_segment_id.fetch_add(1, Ordering::Relaxed));
+        let mut merged = AppendableSegment::new(self.config.dim, self.config.metric);
+        for (g, v) in &points {
+            merged.append(*g, v);
+        }
+        let sealed = Arc::new(merged.seal(seg_id, self.config.hnsw));
+        self.all_segments.write().insert(seg_id, sealed.clone());
+        self.working
+            .store(Arc::new(SegmentSet::from_sealed(vec![sealed])));
+        Some(seg_id)
+    }
+
+    /// Runs a GC pass: drops versions not matched by `retention` and removes any
+    /// segments no longer referenced by a retained version (but never a live working
+    /// segment). Returns the dropped segment ids so the caller can delete their files.
+    pub fn gc(&self, retention: &RetentionRules) -> Vec<SegmentId> {
+        let report = self.versions.lock().gc(retention);
+        let working_ids: HashSet<u64> = self.working.load().iter().map(|s| s.id().get()).collect();
+        let mut all = self.all_segments.write();
+        let mut dropped = Vec::new();
+        for sid in report.orphan_segments {
+            if !working_ids.contains(&sid) && all.remove(&SegmentId::new(sid)).is_some() {
+                dropped.push(SegmentId::new(sid));
+            }
+        }
+        dropped
+    }
+
     /// Diffs two versions' live id sets.
     pub fn diff(&self, from: u64, to: u64) -> Result<Diff> {
         self.versions
@@ -609,6 +657,61 @@ mod tests {
         );
         // And we found a full page (bucket 3 has ~50 points, plenty for k=10).
         assert_eq!(got.len(), 10);
+    }
+
+    #[test]
+    fn compaction_merges_segments() {
+        let dim = 16;
+        let col = Collection::create(config(dim));
+        for batch in 0..3 {
+            col.insert_batch(
+                &(0..30)
+                    .map(|i| vec_of(dim, batch * 100 + i + 1))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            col.seal();
+        }
+        assert_eq!(col.sealed_count(), 3);
+        assert_eq!(col.len(), 90);
+
+        let merged = col.compact();
+        assert!(merged.is_some());
+        assert_eq!(col.sealed_count(), 1);
+        assert_eq!(col.len(), 90);
+        // Search still returns a full page of valid results.
+        let got = col.search(&vec_of(dim, 9_999), 10, None).unwrap();
+        assert_eq!(got.len(), 10);
+    }
+
+    #[test]
+    fn gc_drops_orphaned_segments() {
+        let dim = 8;
+        let col = Collection::create(config(dim));
+        col.insert_batch(&(0..30).map(|i| vec_of(dim, i + 1)).collect::<Vec<_>>())
+            .unwrap();
+        let v0 = col.commit("manual", None, None).unwrap();
+        col.insert_batch(&(0..30).map(|i| vec_of(dim, 100 + i)).collect::<Vec<_>>())
+            .unwrap();
+        col.commit("manual", None, None).unwrap();
+
+        // Compact the two segments into one, then commit a version referencing it.
+        col.compact();
+        col.commit("manual", None, None).unwrap();
+
+        // Keep only the latest version: the two pre-merge segments become orphans.
+        let dropped = col.gc(&RetentionRules {
+            keep_last: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(col.len(), 60);
+        // The dropped version is no longer queryable; live search still works.
+        assert!(
+            col.search_at(&VersionSelector::Version(v0), &vec_of(dim, 1), 5, None)
+                .is_err()
+        );
+        assert_eq!(col.search(&vec_of(dim, 1), 10, None).unwrap().len(), 10);
     }
 
     #[test]

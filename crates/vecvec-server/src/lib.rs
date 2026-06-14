@@ -28,9 +28,28 @@ use crate::grpc::Api;
 /// A boxed error usable across `.await` points.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// How often the background maintenance task checkpoints collections.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Serves the gRPC API (collections + points + query, with health and reflection)
 /// on `listener` until the process is shut down.
 pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), BoxError> {
+    // Background maintenance: periodically checkpoint every collection (folds the
+    // WAL into sealed segments, keeping recovery fast). Cancelled on shutdown.
+    let maintenance = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                for collection in service.registry().snapshot() {
+                    let _ = tokio::task::spawn_blocking(move || collection.checkpoint()).await;
+                }
+            }
+        })
+    };
+
     let api = Api::new(service);
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -46,7 +65,7 @@ pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), B
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
-    Server::builder()
+    let result = Server::builder()
         .add_service(health_service)
         .add_service(reflection)
         .add_service(CollectionsServer::new(api.clone()))
@@ -54,6 +73,9 @@ pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), B
         .add_service(QueryServer::new(api.clone()))
         .add_service(VersioningServer::new(api))
         .serve_with_incoming(TcpListenerStream::new(listener))
-        .await?;
+        .await;
+
+    maintenance.abort();
+    result?;
     Ok(())
 }

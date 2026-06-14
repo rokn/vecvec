@@ -50,6 +50,12 @@ impl SegmentStore {
         )
     }
 
+    /// Deletes a segment's file from disk (used by GC). Best-effort.
+    pub fn remove(&self, id: SegmentId) {
+        let _ = std::fs::remove_file(self.segment_path(id));
+        self.cache.lock().remove(&id);
+    }
+
     /// Loads a sealed segment by id, returning a cached `Arc` if one is live.
     pub fn load(&self, id: SegmentId) -> Result<Arc<SealedSegment>> {
         if let Some(existing) = self.cache.lock().get(&id).and_then(Weak::upgrade) {

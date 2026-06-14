@@ -12,7 +12,7 @@ use std::sync::Arc;
 use super::id_map::IdMap;
 use super::search::SegmentLiveFilter;
 use crate::distance::{DistanceKernel, Metric};
-use crate::id::{GlobalId, SegmentId};
+use crate::id::{GlobalId, LocalId, PointId, SegmentId};
 use crate::index::{HnswIndex, Index, SearchParams, scan_topk};
 use crate::payload::FilterQuery;
 use crate::version::DeletionVector;
@@ -68,6 +68,17 @@ impl SealedSegment {
     #[inline]
     pub fn contains(&self, global: GlobalId) -> bool {
         self.ids.to_local(global).is_some()
+    }
+
+    /// Iterates `(global_id, vector)` for every row (used by compaction).
+    pub(crate) fn iter_points(&self) -> impl Iterator<Item = (GlobalId, &[f32])> {
+        let vectors = self.index.vectors();
+        (0..self.len() as u32).map(move |local| {
+            (
+                self.ids.global_at(LocalId::new(local)),
+                vectors.get(PointId::new(local)),
+            )
+        })
     }
 
     /// The inclusive global-id range this segment spans, or `None` if empty.
