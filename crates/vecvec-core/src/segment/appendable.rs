@@ -1,11 +1,10 @@
 //! The mutable appendable segment.
 //!
 //! All hot writes land in one small appendable segment per collection: vectors are
-//! pushed into a contiguous [`VectorStorage`] and searched by exact flat scan (the
-//! benched [`scan_topk`](crate::index::scan_topk) path). A background optimizer
-//! later *seals* it — [`AppendableSegment::seal`] — into an immutable
-//! [`SealedSegment`](super::SealedSegment); from M5 sealing also builds an HNSW and
-//! quantizes. Until then a sealed segment simply keeps flat-scanning.
+//! pushed into a contiguous [`VectorStorage`] and searched by exact flat scan. It is
+//! purely additive — **deletions are collection-level**, not stored here — so the
+//! segment is trivially snapshot-able. A background optimizer later *seals* it into
+//! an immutable [`SealedSegment`](super::SealedSegment) with a built HNSW.
 
 use std::sync::Arc;
 
@@ -13,15 +12,16 @@ use super::id_map::IdMap;
 use super::sealed::SealedSegment;
 use super::search::search_local;
 use crate::distance::{DistanceKernel, Metric};
-use crate::id::{GlobalId, LocalId, PointId, SegmentId};
-use crate::index::{FilterContext, HnswConfig, HnswIndex, Index, SoftDeleteSet};
+use crate::id::SegmentId;
+use crate::id::{GlobalId, LocalId};
+use crate::index::{FilterContext, HnswConfig, HnswIndex};
 use crate::vector::VectorStorage;
+use crate::version::DeletionVector;
 
 /// A growable, in-RAM segment that accepts appends and serves exact search.
 pub struct AppendableSegment {
     vectors: VectorStorage,
     ids: IdMap,
-    deleted: SoftDeleteSet,
     kernel: DistanceKernel,
 }
 
@@ -31,7 +31,6 @@ impl AppendableSegment {
         Self {
             vectors: VectorStorage::new(dim, metric),
             ids: IdMap::new(),
-            deleted: SoftDeleteSet::new(),
             kernel: DistanceKernel::new(metric, dim),
         }
     }
@@ -48,7 +47,7 @@ impl AppendableSegment {
         self.vectors.metric()
     }
 
-    /// The total number of appended rows (including tombstones).
+    /// The number of rows.
     #[inline]
     pub fn len(&self) -> usize {
         self.vectors.len()
@@ -60,18 +59,7 @@ impl AppendableSegment {
         self.vectors.is_empty()
     }
 
-    /// The number of live (non-tombstoned) rows.
-    #[inline]
-    pub fn live_len(&self) -> usize {
-        self.vectors
-            .len()
-            .saturating_sub(self.deleted.deleted_count())
-    }
-
     /// Appends `vector` under collection-global id `global`, returning its local id.
-    ///
-    /// # Panics
-    /// Panics if `vector.len() != self.dim()`.
     pub fn append(&mut self, global: GlobalId, vector: &[f32]) -> LocalId {
         let pid = self.vectors.push(vector);
         let lid = self.ids.push(global);
@@ -79,55 +67,44 @@ impl AppendableSegment {
         lid
     }
 
-    /// Tombstones the row for `global`, if present. Returns whether it was newly
-    /// deleted.
-    pub fn delete_global(&self, global: GlobalId) -> bool {
-        match self.ids.to_local(global) {
-            Some(local) => self.deleted.delete(local.to_point()),
-            None => false,
-        }
-    }
-
-    /// Whether `global` is mapped by this segment (whether or not it's tombstoned).
+    /// Whether `global` is in this segment.
     #[inline]
     pub fn contains(&self, global: GlobalId) -> bool {
         self.ids.to_local(global).is_some()
     }
 
-    /// Whether `global` is present and live in this segment.
-    pub fn contains_live(&self, global: GlobalId) -> bool {
-        match self.ids.to_local(global) {
-            Some(local) => !self.deleted.is_deleted(local.to_point()),
-            None => false,
+    /// The inclusive global-id range this segment spans, or `None` if empty.
+    pub fn global_id_range(&self) -> Option<(u64, u64)> {
+        let ids = self.ids.global_ids();
+        match (ids.first(), ids.last()) {
+            (Some(lo), Some(hi)) => Some((lo.get().min(hi.get()), lo.get().max(hi.get()))),
+            _ => None,
         }
     }
 
-    /// Exact top-k search, returning `(global_id, score)` best-first.
+    /// Exact top-k search excluding `deletions`, returning `(global_id, score)`.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
-        filter: Option<&dyn FilterContext>,
+        deletions: &DeletionVector,
+        payload: Option<&dyn FilterContext>,
     ) -> Vec<(GlobalId, f32)> {
         search_local(
             &self.vectors,
             &self.kernel,
             &self.ids,
-            &self.deleted,
+            deletions,
             query,
             k,
-            filter,
+            payload,
         )
     }
 
-    /// Seals this segment into an immutable, HNSW-backed [`SealedSegment`] with id
-    /// `id`, consuming it. Builds the graph and carries over any tombstones.
+    /// Seals this segment into an immutable, HNSW-backed [`SealedSegment`].
     pub fn seal(self, id: SegmentId, config: HnswConfig) -> SealedSegment {
         let vectors = Arc::new(self.vectors);
         let index = HnswIndex::build(vectors, config);
-        for local in self.deleted.snapshot().iter() {
-            index.delete(PointId::new(local));
-        }
         SealedSegment::from_index(id, Arc::new(index), self.ids)
     }
 }
@@ -137,23 +114,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn append_search_delete() {
+    fn append_and_search() {
         let mut seg = AppendableSegment::new(3, Metric::Dot);
         let g0 = GlobalId::new(10);
         let g1 = GlobalId::new(11);
         seg.append(g0, &[1.0, 0.0, 0.0]);
         seg.append(g1, &[0.0, 1.0, 0.0]);
         assert_eq!(seg.len(), 2);
-        assert_eq!(seg.live_len(), 2);
+        assert_eq!(seg.global_id_range(), Some((10, 11)));
 
-        let res = seg.search(&[1.0, 0.0, 0.0], 2, None);
-        assert_eq!(res[0].0, g0); // best match is the aligned vector
+        let empty = DeletionVector::new();
+        let res = seg.search(&[1.0, 0.0, 0.0], 2, &empty, None);
+        assert_eq!(res[0].0, g0);
 
-        assert!(seg.delete_global(g0));
-        assert!(!seg.delete_global(g0));
-        assert!(!seg.contains_live(g0));
-        assert_eq!(seg.live_len(), 1);
-        let res = seg.search(&[1.0, 0.0, 0.0], 2, None);
+        // A deletion vector excludes the point from results.
+        let mut dv = DeletionVector::new();
+        dv.insert(g0);
+        let res = seg.search(&[1.0, 0.0, 0.0], 2, &dv, None);
         assert!(res.iter().all(|(g, _)| *g != g0));
     }
 }

@@ -84,6 +84,13 @@ pub enum CoreError {
         /// What went wrong.
         detail: String,
     },
+
+    /// A versioning operation failed (e.g. an unknown version/tag/branch).
+    #[error("version error: {detail}")]
+    Version {
+        /// What went wrong.
+        detail: String,
+    },
 }
 
 impl CoreError {

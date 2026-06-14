@@ -31,6 +31,7 @@ use crate::index::FilterContext;
 use crate::persist::atomic::{FileKind, read_framed, write_atomic};
 use crate::persist::wal::{Wal, WalOp};
 use crate::segment::SegmentStore;
+use crate::version::DeletionVector;
 
 const HEAD_FORMAT_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "config";
@@ -73,6 +74,8 @@ struct CheckpointHead {
     sealed_ids: Vec<u64>,
     next_global_id: u64,
     next_segment_id: u64,
+    #[serde(default)]
+    deletions: crate::version::DeletionVector,
 }
 
 struct WalState {
@@ -87,6 +90,8 @@ pub struct DurableCollection {
     dir: PathBuf,
     wal: Mutex<WalState>,
     fsync: FsyncMode,
+    trigger: Mutex<crate::version::TriggerEvaluator>,
+    clock: crate::version::SystemClock,
 }
 
 impl DurableCollection {
@@ -96,7 +101,9 @@ impl DurableCollection {
         std::fs::create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
         write_config_if_absent(&dir, &config)?;
         let store = SegmentStore::new(dir.join("segments"));
+        let policy = config.versioning;
         let collection = Arc::new(Collection::create(config));
+        let clock = crate::version::SystemClock;
 
         // Recover the checkpoint, if any.
         let head_path = dir.join("HEAD");
@@ -112,6 +119,7 @@ impl DurableCollection {
             }
             collection.install_sealed(segments);
             collection.set_allocators(head.next_global_id, head.next_segment_id);
+            collection.set_deletions(head.deletions);
             head.wal_generation
         } else {
             0
@@ -129,6 +137,8 @@ impl DurableCollection {
             dir,
             wal: Mutex::new(WalState { wal, generation }),
             fsync,
+            trigger: Mutex::new(crate::version::TriggerEvaluator::new(policy, &clock)),
+            clock,
         })
     }
 
@@ -186,7 +196,57 @@ impl DurableCollection {
         for (id, v) in ids.iter().zip(&vectors) {
             self.collection.insert_with_id(GlobalId::new(*id), v)?;
         }
+        drop(guard);
+
+        // Auto-commit if the versioning policy's trigger has fired.
+        let mut trigger = self.trigger.lock();
+        trigger.record_writes(ids.len() as u64);
+        if trigger.should_commit(&self.clock) {
+            self.collection.commit("auto", None, None)?;
+            trigger.note_commit(&self.clock);
+        }
         Ok(ids)
+    }
+
+    /// Explicitly commits the working state as a new version.
+    pub fn commit(&self, message: Option<String>, tag: Option<String>) -> Result<u64> {
+        self.collection.commit("manual", message, tag)
+    }
+
+    /// Time-travel search as of a version/tag/branch.
+    pub fn search_at(
+        &self,
+        selector: &crate::version::VersionSelector,
+        query: &[f32],
+        k: usize,
+        filter: Option<&dyn FilterContext>,
+    ) -> Result<Vec<ScoredGlobal>> {
+        self.collection.search_at(selector, query, k, filter)
+    }
+
+    /// Diffs two versions.
+    pub fn diff(&self, from: u64, to: u64) -> Result<crate::version::Diff> {
+        self.collection.diff(from, to)
+    }
+
+    /// Restores the working state to a version (a forward commit).
+    pub fn restore(&self, version: u64) -> Result<u64> {
+        self.collection.restore(version)
+    }
+
+    /// Tags a version.
+    pub fn create_tag(&self, name: impl Into<String>, version: u64) -> Result<()> {
+        self.collection.create_tag(name, version)
+    }
+
+    /// Branches from a version.
+    pub fn create_branch(&self, name: impl Into<String>, version: u64) -> Result<()> {
+        self.collection.create_branch(name, version)
+    }
+
+    /// All committed versions, oldest first.
+    pub fn list_versions(&self) -> Vec<Arc<crate::version::Manifest>> {
+        self.collection.list_versions()
     }
 
     /// Durably tombstones a point. Returns whether it was newly deleted.
@@ -235,6 +295,7 @@ impl DurableCollection {
             sealed_ids,
             next_global_id: self.collection.next_global_id_value(),
             next_segment_id: self.collection.next_segment_id_value(),
+            deletions: DeletionVector::clone(&self.collection.deletions_snapshot()),
         };
         let head_bytes = rmp_serde::to_vec(&head).map_err(|e| CoreError::Serialization {
             detail: e.to_string(),

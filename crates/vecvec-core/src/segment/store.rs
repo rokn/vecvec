@@ -83,6 +83,7 @@ mod tests {
     use crate::index::brute_force_topk;
     use crate::segment::AppendableSegment;
     use crate::vector::VectorStorage;
+    use crate::version::DeletionVector;
     use crate::{GlobalId, HnswConfig};
 
     fn vec_of(dim: usize, seed: u32) -> Vec<f32> {
@@ -120,8 +121,9 @@ mod tests {
 
         // The reopened segment returns the same results as the original.
         let query = vec_of(dim, 77_777);
-        let original = seg.search(&query, 10, None);
-        let reopened = loaded.search(&query, 10, None);
+        let dv = DeletionVector::new();
+        let original = seg.search(&query, 10, &dv, None);
+        let reopened = loaded.search(&query, 10, &dv, None);
         assert_eq!(original, reopened);
     }
 
@@ -143,8 +145,9 @@ mod tests {
         let trials = 20usize;
         for q in 0..trials {
             let query = vec_of(dim, 500_000 + q as u32);
+            let dv = DeletionVector::new();
             let got: std::collections::HashSet<u64> = seg
-                .search(&query, 10, None)
+                .search(&query, 10, &dv, None)
                 .into_iter()
                 .map(|(g, _)| g.get())
                 .collect();

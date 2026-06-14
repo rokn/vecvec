@@ -27,6 +27,7 @@ pub mod ordered;
 pub mod persist;
 pub mod segment;
 pub mod vector;
+pub mod version;
 
 pub use collection::{Collection, CollectionConfig, ScoredGlobal};
 pub use distance::{DistanceKernel, Metric};

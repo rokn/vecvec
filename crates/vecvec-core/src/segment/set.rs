@@ -44,9 +44,10 @@ impl SegmentSet {
         self.sealed.iter()
     }
 
-    /// The total number of live rows across all sealed segments.
-    pub fn total_live(&self) -> usize {
-        self.sealed.iter().map(|s| s.live_len()).sum()
+    /// The total number of rows across all sealed segments (deletions are tracked
+    /// at the collection level, not here).
+    pub fn total_rows(&self) -> usize {
+        self.sealed.iter().map(|s| s.len()).sum()
     }
 
     /// Returns a new set with `segment` appended, sharing all existing segments by

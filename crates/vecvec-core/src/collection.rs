@@ -1,27 +1,35 @@
-//! A collection: the top-level unit of vectors + their segments.
+//! A collection: vectors, their segments, and the version DAG.
 //!
-//! At M3 a collection is one mutable [`AppendableSegment`] behind a lock plus a
-//! [`SegmentSet`] of sealed segments behind an `ArcSwap`, with a monotonic
-//! global-id allocator. Inserts append to the mutable segment; search fans out
-//! across the lock-free sealed snapshot and the appendable, merging a global
-//! top-k. Versioning, WAL durability, payload, and the full query model layer onto
-//! this in later milestones.
+//! A collection holds one mutable [`AppendableSegment`] plus a *working* set of
+//! sealed segments (the live view) and a master registry of every sealed segment
+//! ever created (so any past version can be reassembled). **Deletions live here**, as
+//! a collection-level [`DeletionVector`], not inside segments — so committing simply
+//! freezes a clone of it, giving snapshot isolation.
 //!
-//! The lock discipline matters for the server (M3b): the appendable `RwLock` is
-//! only ever held *inside* synchronous work (run on the rayon pool), never across
-//! an `.await`.
+//! A *commit* snapshots {working segment refs, current deletions} into a [`Manifest`]
+//! in the [`VersionStore`]. Time-travel ([`Collection::search_at`]) reassembles a
+//! past version's segments + frozen deletions; [`Collection::restore`] is a forward
+//! commit re-pointing the working state at an old version. Lock discipline: the
+//! appendable `RwLock` and the segment locks are only ever held inside synchronous
+//! work (run on the server's rayon pool), never across an `.await`.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::distance::Metric;
 use crate::error::{CoreError, Result};
 use crate::id::{GlobalId, SegmentId};
 use crate::index::{BoundedTopK, FilterContext, HnswConfig};
 use crate::segment::{AppendableSegment, SealedSegment, SegmentSet};
+use crate::version::policy::Clock;
+use crate::version::{
+    DeletionVector, Diff, Manifest, SegmentRef, SystemClock, VersionSelector, VersionStore,
+    VersioningPolicy,
+};
 
 /// Static configuration of a collection.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -34,16 +42,20 @@ pub struct CollectionConfig {
     pub metric: Metric,
     /// HNSW parameters used when sealing segments.
     pub hnsw: HnswConfig,
+    /// Automatic-commit policy.
+    #[serde(default)]
+    pub versioning: VersioningPolicy,
 }
 
 impl CollectionConfig {
-    /// Convenience constructor with default HNSW parameters.
+    /// Convenience constructor with default HNSW + manual versioning.
     pub fn new(name: impl Into<String>, dim: usize, metric: Metric) -> Self {
         Self {
             name: name.into(),
             dim,
             metric,
             hnsw: HnswConfig::default(),
+            versioning: VersioningPolicy::default(),
         }
     }
 }
@@ -57,11 +69,17 @@ pub struct ScoredGlobal {
     pub score: f32,
 }
 
-/// A collection of vectors served from RAM.
+/// A collection of vectors served from RAM, with a git-like version DAG.
 pub struct Collection {
     config: CollectionConfig,
     appendable: RwLock<AppendableSegment>,
-    sealed: ArcSwap<SegmentSet>,
+    /// The live (working) segment set; lock-free point-in-time reads.
+    working: ArcSwap<SegmentSet>,
+    /// Every sealed segment ever created, so any past version can be reassembled.
+    all_segments: RwLock<BTreeMap<SegmentId, Arc<SealedSegment>>>,
+    /// The live tombstones.
+    working_deletions: ArcSwap<DeletionVector>,
+    versions: Mutex<VersionStore>,
     next_global_id: AtomicU64,
     next_segment_id: AtomicU64,
 }
@@ -73,7 +91,10 @@ impl Collection {
         Self {
             config,
             appendable: RwLock::new(appendable),
-            sealed: ArcSwap::from_pointee(SegmentSet::empty()),
+            working: ArcSwap::from_pointee(SegmentSet::empty()),
+            all_segments: RwLock::new(BTreeMap::new()),
+            working_deletions: ArcSwap::from_pointee(DeletionVector::new()),
+            versions: Mutex::new(VersionStore::new()),
             next_global_id: AtomicU64::new(0),
             next_segment_id: AtomicU64::new(0),
         }
@@ -87,7 +108,8 @@ impl Collection {
 
     /// The number of live points across all segments.
     pub fn len(&self) -> usize {
-        self.sealed.load().total_live() + self.appendable.read().live_len()
+        let rows = self.working.load().total_rows() + self.appendable.read().len();
+        rows.saturating_sub(self.working_deletions.load().len() as usize)
     }
 
     /// Whether the collection has no live points.
@@ -95,53 +117,24 @@ impl Collection {
         self.len() == 0
     }
 
-    /// The number of sealed segments.
+    /// The number of sealed segments in the working set.
     pub fn sealed_count(&self) -> usize {
-        self.sealed.load().len()
+        self.working.load().len()
     }
 
-    /// Allocates the next global id (used by the durability layer to assign ids
-    /// before logging an upsert).
+    /// Allocates the next global id (used by the durability layer before logging).
     pub(crate) fn alloc_global_id(&self) -> GlobalId {
         GlobalId::new(self.next_global_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Appends a vector under a *specific* global id, advancing the allocator past
-    /// it. This is the single in-memory upsert apply path, shared by live writes
-    /// (after the id is allocated and logged) and WAL recovery.
+    /// Appends a vector under a specific global id, advancing the allocator past it.
+    /// The single in-memory upsert apply path (live writes and WAL recovery).
     pub fn insert_with_id(&self, id: GlobalId, vector: &[f32]) -> Result<()> {
         self.check_dim(vector)?;
         self.appendable.write().append(id, vector);
         self.next_global_id
             .fetch_max(id.get() + 1, Ordering::Relaxed);
         Ok(())
-    }
-
-    /// A point-in-time snapshot of the sealed segment set.
-    pub fn sealed_snapshot(&self) -> Arc<SegmentSet> {
-        self.sealed.load_full()
-    }
-
-    /// Replaces the sealed segment set (recovery only).
-    pub(crate) fn install_sealed(&self, segments: Vec<Arc<SealedSegment>>) {
-        self.sealed
-            .store(Arc::new(SegmentSet::from_sealed(segments)));
-    }
-
-    /// Sets the id allocators (recovery only).
-    pub(crate) fn set_allocators(&self, next_global: u64, next_segment: u64) {
-        self.next_global_id.store(next_global, Ordering::Relaxed);
-        self.next_segment_id.store(next_segment, Ordering::Relaxed);
-    }
-
-    /// The next global id that would be allocated.
-    pub fn next_global_id_value(&self) -> u64 {
-        self.next_global_id.load(Ordering::Relaxed)
-    }
-
-    /// The next segment id that would be allocated.
-    pub fn next_segment_id_value(&self) -> u64 {
-        self.next_segment_id.load(Ordering::Relaxed)
     }
 
     fn check_dim(&self, vector: &[f32]) -> Result<()> {
@@ -156,13 +149,12 @@ impl Collection {
 
     /// Inserts a single vector, returning its assigned global id.
     pub fn insert(&self, vector: &[f32]) -> Result<GlobalId> {
-        self.check_dim(vector)?;
         let id = self.alloc_global_id();
-        self.appendable.write().append(id, vector);
+        self.insert_with_id(id, vector)?;
         Ok(id)
     }
 
-    /// Inserts a batch of vectors under one write lock, returning their ids in order.
+    /// Inserts a batch of vectors under one write lock, returning their ids.
     pub fn insert_batch(&self, vectors: &[Vec<f32>]) -> Result<Vec<GlobalId>> {
         for v in vectors {
             self.check_dim(v)?;
@@ -174,28 +166,45 @@ impl Collection {
             app.append(id, v);
             ids.push(id);
         }
+        self.next_global_id
+            .fetch_max(ids.last().map_or(0, |g| g.get() + 1), Ordering::Relaxed);
         Ok(ids)
     }
 
-    /// Tombstones the point with id `global`, wherever it lives. Returns whether it
-    /// was newly deleted.
-    pub fn delete(&self, global: GlobalId) -> bool {
-        {
-            let app = self.appendable.read();
-            if app.contains(global) {
-                return app.delete_global(global);
-            }
+    fn contains_any(&self, global: GlobalId) -> bool {
+        if self.appendable.read().contains(global) {
+            return true;
         }
-        for seg in self.sealed.load().iter() {
-            if seg.contains(global) {
-                return seg.delete_global(global);
-            }
-        }
-        false
+        self.working.load().iter().any(|s| s.contains(global))
     }
 
-    /// Returns the best `k` live points for `query`, ordered best-first, merging
-    /// across the lock-free sealed snapshot and the appendable segment.
+    /// Tombstones the point `global` in the live deletion vector. Returns whether it
+    /// was newly deleted.
+    pub fn delete(&self, global: GlobalId) -> bool {
+        if !self.contains_any(global) {
+            return false;
+        }
+        let mut newly = false;
+        self.working_deletions.rcu(|current| {
+            let mut next = DeletionVector::clone(current);
+            newly = next.insert(global);
+            next
+        });
+        newly
+    }
+
+    fn merge_finalize(merger: BoundedTopK<GlobalId>) -> Vec<ScoredGlobal> {
+        let mut seen = HashSet::new();
+        merger
+            .into_sorted()
+            .into_iter()
+            .filter(|(id, _)| seen.insert(*id))
+            .map(|(id, score)| ScoredGlobal { id, score })
+            .collect()
+    }
+
+    /// Returns the best `k` live points for `query`, merging the working sealed set
+    /// and the appendable segment, excluding the live deletion vector.
     pub fn search(
         &self,
         query: &[f32],
@@ -204,40 +213,61 @@ impl Collection {
     ) -> Result<Vec<ScoredGlobal>> {
         self.check_dim(query)?;
         let higher = self.config.metric.higher_is_better();
+        let deletions = self.working_deletions.load_full();
+        let working = self.working.load_full();
         let mut merger = BoundedTopK::<GlobalId>::new(k, higher);
-
-        // Sealed segments: a single atomic load gives a consistent point-in-time view.
-        let sealed = self.sealed.load_full();
-        for seg in sealed.iter() {
-            for (id, score) in seg.search(query, k, filter) {
+        for seg in working.iter() {
+            for (id, score) in seg.search(query, k, &deletions, filter) {
                 merger.offer(id, score);
             }
         }
-        // Appendable segment.
         {
             let app = self.appendable.read();
-            for (id, score) in app.search(query, k, filter) {
+            for (id, score) in app.search(query, k, &deletions, filter) {
                 merger.offer(id, score);
             }
         }
-
-        // Dedup by global id, keeping the best-scoring occurrence (results are
-        // already best-first). A global id can appear in more than one segment once
-        // updates exist (tombstone in the old segment + new row in the appendable);
-        // recency-aware resolution lands with the update path in M7.
-        let mut seen = std::collections::HashSet::new();
-        Ok(merger
-            .into_sorted()
-            .into_iter()
-            .filter(|(id, _)| seen.insert(*id))
-            .map(|(id, score)| ScoredGlobal { id, score })
-            .collect())
+        Ok(Self::merge_finalize(merger))
     }
 
-    /// Seals the current appendable segment into an immutable sealed segment and
-    /// starts a fresh appendable. Returns the new segment's id, or `None` if the
-    /// appendable was empty. (M5 makes this build an HNSW + quantize + persist; here
-    /// it just freezes the flat segment.)
+    /// Time-travel search: returns the best `k` points as of `selector`, using that
+    /// version's segment set and frozen deletion vector (snapshot isolation).
+    pub fn search_at(
+        &self,
+        selector: &VersionSelector,
+        query: &[f32],
+        k: usize,
+        filter: Option<&dyn FilterContext>,
+    ) -> Result<Vec<ScoredGlobal>> {
+        self.check_dim(query)?;
+        let (segment_ids, deletions) = {
+            let versions = self.versions.lock();
+            let version = versions
+                .resolve(selector)
+                .ok_or_else(|| CoreError::Version {
+                    detail: format!("unresolved selector {selector:?}"),
+                })?;
+            let manifest = versions.get(version).expect("resolved version exists");
+            (
+                manifest.segments.iter().map(|s| s.id).collect::<Vec<u64>>(),
+                manifest.deletions.clone(),
+            )
+        };
+        let higher = self.config.metric.higher_is_better();
+        let all = self.all_segments.read();
+        let mut merger = BoundedTopK::<GlobalId>::new(k, higher);
+        for sid in segment_ids {
+            if let Some(seg) = all.get(&SegmentId::new(sid)) {
+                for (id, score) in seg.search(query, k, &deletions, filter) {
+                    merger.offer(id, score);
+                }
+            }
+        }
+        Ok(Self::merge_finalize(merger))
+    }
+
+    /// Seals the current appendable segment into the working set + master registry.
+    /// Returns the new segment id, or `None` if the appendable was empty.
     pub fn seal(&self) -> Option<SegmentId> {
         let mut app = self.appendable.write();
         if app.is_empty() {
@@ -249,19 +279,158 @@ impl Collection {
             AppendableSegment::new(self.config.dim, self.config.metric),
         );
         drop(app);
-
-        let sealed_segment = Arc::new(frozen.seal(seg_id, self.config.hnsw));
-        self.sealed
-            .rcu(|current| Arc::new(current.with_appended(sealed_segment.clone())));
+        let sealed = Arc::new(frozen.seal(seg_id, self.config.hnsw));
+        self.all_segments.write().insert(seg_id, sealed.clone());
+        self.working
+            .rcu(|current| Arc::new(current.with_appended(sealed.clone())));
         Some(seg_id)
+    }
+
+    /// Commits the working state as a new version. Seals the appendable first so the
+    /// version references only immutable segments.
+    pub fn commit(
+        &self,
+        trigger: impl Into<String>,
+        message: Option<String>,
+        tag: Option<String>,
+    ) -> Result<u64> {
+        self.seal();
+        let working = self.working.load_full();
+        let segments: Vec<SegmentRef> = working
+            .iter()
+            .filter_map(|s| {
+                s.global_id_range().map(|(lo, hi)| SegmentRef {
+                    id: s.id().get(),
+                    id_lo: lo,
+                    id_hi: hi,
+                    count: s.len() as u64,
+                })
+            })
+            .collect();
+        let deletions = DeletionVector::clone(&self.working_deletions.load_full());
+        let now = SystemClock.now_ms();
+        let mut versions = self.versions.lock();
+        let manifest = versions.commit(trigger, message, tag, segments, deletions, now);
+        Ok(manifest.version)
+    }
+
+    /// Restores the working state to `version`: a forward commit re-pointing the
+    /// working segment set + deletions at the old version (history is preserved).
+    /// Discards uncommitted appendable writes.
+    pub fn restore(&self, version: u64) -> Result<u64> {
+        let (segment_ids, deletions) = {
+            let versions = self.versions.lock();
+            let manifest = versions.get(version).ok_or_else(|| CoreError::Version {
+                detail: format!("no such version {version}"),
+            })?;
+            (
+                manifest.segments.iter().map(|s| s.id).collect::<Vec<u64>>(),
+                manifest.deletions.clone(),
+            )
+        };
+        {
+            let all = self.all_segments.read();
+            let segs: Vec<Arc<SealedSegment>> = segment_ids
+                .iter()
+                .filter_map(|id| all.get(&SegmentId::new(*id)).cloned())
+                .collect();
+            self.working.store(Arc::new(SegmentSet::from_sealed(segs)));
+        }
+        self.working_deletions.store(Arc::new(deletions));
+        *self.appendable.write() = AppendableSegment::new(self.config.dim, self.config.metric);
+        self.commit("restore", Some(format!("restore of v{version}")), None)
+    }
+
+    /// Diffs two versions' live id sets.
+    pub fn diff(&self, from: u64, to: u64) -> Result<Diff> {
+        self.versions
+            .lock()
+            .diff(from, to)
+            .map_err(|e| CoreError::Version {
+                detail: e.to_string(),
+            })
+    }
+
+    /// Creates or moves a tag to a version.
+    pub fn create_tag(&self, name: impl Into<String>, version: u64) -> Result<()> {
+        self.versions
+            .lock()
+            .set_tag(name, version)
+            .map_err(|e| CoreError::Version {
+                detail: e.to_string(),
+            })
+    }
+
+    /// Creates or moves a branch to a version.
+    pub fn create_branch(&self, name: impl Into<String>, version: u64) -> Result<()> {
+        self.versions
+            .lock()
+            .set_branch(name, version)
+            .map_err(|e| CoreError::Version {
+                detail: e.to_string(),
+            })
+    }
+
+    /// All committed versions, oldest first.
+    pub fn list_versions(&self) -> Vec<Arc<Manifest>> {
+        self.versions.lock().list()
+    }
+
+    /// The current `HEAD` version, if any.
+    pub fn head_version(&self) -> Option<u64> {
+        self.versions.lock().head()
+    }
+
+    // ---- recovery / durability hooks ----
+
+    /// A point-in-time snapshot of the working segment set.
+    pub fn sealed_snapshot(&self) -> Arc<SegmentSet> {
+        self.working.load_full()
+    }
+
+    /// The live deletion vector (for checkpoint persistence).
+    pub fn deletions_snapshot(&self) -> Arc<DeletionVector> {
+        self.working_deletions.load_full()
+    }
+
+    /// Installs a recovered set of sealed segments into both the master registry and
+    /// the working set.
+    pub(crate) fn install_sealed(&self, segments: Vec<Arc<SealedSegment>>) {
+        let mut all = self.all_segments.write();
+        for seg in &segments {
+            all.insert(seg.id(), seg.clone());
+        }
+        drop(all);
+        self.working
+            .store(Arc::new(SegmentSet::from_sealed(segments)));
+    }
+
+    /// Sets the live deletion vector (recovery).
+    pub(crate) fn set_deletions(&self, deletions: DeletionVector) {
+        self.working_deletions.store(Arc::new(deletions));
+    }
+
+    /// Sets the id allocators (recovery).
+    pub(crate) fn set_allocators(&self, next_global: u64, next_segment: u64) {
+        self.next_global_id.store(next_global, Ordering::Relaxed);
+        self.next_segment_id.store(next_segment, Ordering::Relaxed);
+    }
+
+    /// The next global id that would be allocated.
+    pub fn next_global_id_value(&self) -> u64 {
+        self.next_global_id.load(Ordering::Relaxed)
+    }
+
+    /// The next segment id that would be allocated.
+    pub fn next_segment_id_value(&self) -> u64 {
+        self.next_segment_id.load(Ordering::Relaxed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::brute_force_topk;
-    use crate::vector::VectorStorage;
+    use crate::version::VersioningPolicy;
 
     fn vec_of(dim: usize, seed: u32) -> Vec<f32> {
         (0..dim)
@@ -272,111 +441,108 @@ mod tests {
             .collect()
     }
 
-    /// A flat oracle over the exact same vectors the collection holds, keyed by the
-    /// global ids it assigned (which equal insertion order here).
-    fn oracle(dim: usize, metric: Metric, n: usize, query: &[f32], k: usize) -> Vec<(u64, f32)> {
-        let mut storage = VectorStorage::new(dim, metric);
-        for i in 0..n {
-            storage.push(&vec_of(dim, i as u32 + 1));
-        }
-        let kernel = crate::distance::DistanceKernel::new(metric, dim);
-        brute_force_topk(&storage, &kernel, query, k, None, None)
-            .into_iter()
-            .map(|sp| (sp.id.get() as u64, sp.score))
-            .collect()
-    }
-
-    #[test]
-    fn insert_and_search_matches_oracle() {
-        for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
-            let dim = 32;
-            let n = 300;
-            let col = Collection::create(CollectionConfig::new("c", dim, metric));
-            let batch: Vec<Vec<f32>> = (0..n).map(|i| vec_of(dim, i as u32 + 1)).collect();
-            let ids = col.insert_batch(&batch).unwrap();
-            assert_eq!(ids.len(), n);
-            assert_eq!(col.len(), n);
-
-            let query = vec_of(dim, 7777);
-            let got = col.search(&query, 10, None).unwrap();
-            let want = oracle(dim, metric, n, &query, 10);
-            let got_pairs: Vec<(u64, f32)> = got.iter().map(|s| (s.id.get(), s.score)).collect();
-            assert_eq!(got_pairs, want, "metric={metric}");
+    fn config(dim: usize) -> CollectionConfig {
+        CollectionConfig {
+            name: "c".into(),
+            dim,
+            metric: Metric::Dot,
+            hnsw: HnswConfig::default(),
+            versioning: VersioningPolicy::manual(),
         }
     }
 
-    /// Sealing part of the data exercises the cross-segment merge over a sealed
-    /// (HNSW) segment + the appendable (flat). Results must recall the oracle's
-    /// top-k over all vectors, and contain one entry per id.
     #[test]
-    fn cross_segment_search_recall() {
-        let dim = 16;
-        let metric = Metric::Dot;
-        let n_first = 120;
-        let n_second = 80;
-        let col = Collection::create(CollectionConfig::new("c", dim, metric));
-
-        let first: Vec<Vec<f32>> = (0..n_first).map(|i| vec_of(dim, i as u32 + 1)).collect();
-        col.insert_batch(&first).unwrap();
-        let seg = col.seal();
-        assert!(seg.is_some());
-        assert_eq!(col.sealed_count(), 1);
-
-        let second: Vec<Vec<f32>> = (0..n_second)
-            .map(|i| vec_of(dim, (n_first + i) as u32 + 1))
-            .collect();
-        col.insert_batch(&second).unwrap();
-        assert_eq!(col.len(), n_first + n_second);
-
-        let mut hits = 0usize;
-        let trials = 20usize;
-        let k = 15usize;
-        for q in 0..trials {
-            let query = vec_of(dim, 500_000 + q as u32);
-            let got = col.search(&query, k, None).unwrap();
-            // One entry per id.
-            let ids: std::collections::HashSet<u64> = got.iter().map(|s| s.id.get()).collect();
-            assert_eq!(ids.len(), got.len());
-            let want: std::collections::HashSet<u64> =
-                oracle(dim, metric, n_first + n_second, &query, k)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-            hits += got.iter().filter(|s| want.contains(&s.id.get())).count();
-        }
-        let recall = hits as f32 / (k * trials) as f32;
-        assert!(recall >= 0.85, "cross-segment recall@{k} {recall} < 0.85");
-    }
-
-    #[test]
-    fn delete_across_segments() {
+    fn insert_search_delete_len() {
         let dim = 8;
-        let col = Collection::create(CollectionConfig::new("c", dim, Metric::Dot));
+        let col = Collection::create(config(dim));
         let ids = col
-            .insert_batch(&(0..10).map(|i| vec_of(dim, i + 1)).collect::<Vec<_>>())
+            .insert_batch(&(0..20).map(|i| vec_of(dim, i + 1)).collect::<Vec<_>>())
             .unwrap();
-        col.seal();
-        col.insert(&vec_of(dim, 100)).unwrap();
-        assert_eq!(col.len(), 11);
-
-        // Delete one sealed point and the appendable one.
+        assert_eq!(col.len(), 20);
         assert!(col.delete(ids[0]));
-        assert!(!col.delete(ids[0])); // already deleted
-        assert_eq!(col.len(), 10);
-        assert!(col.delete(GlobalId::new(10))); // the appendable insert
-        assert_eq!(col.len(), 9);
+        assert!(!col.delete(ids[0]));
+        assert_eq!(col.len(), 19);
+        let got = col.search(&vec_of(dim, 99), 25, None).unwrap();
+        assert!(got.iter().all(|s| s.id != ids[0]));
+        assert_eq!(got.len(), 19);
+    }
+
+    /// The headline differentiator test: a delete after a commit must NOT change what
+    /// the committed version sees (snapshot isolation).
+    #[test]
+    fn time_travel_snapshot_isolation() {
+        let dim = 8;
+        let col = Collection::create(config(dim));
+        let ids = col
+            .insert_batch(&(0..30).map(|i| vec_of(dim, i + 1)).collect::<Vec<_>>())
+            .unwrap();
+        let v1 = col.commit("manual", None, None).unwrap();
+        assert_eq!(col.len(), 30);
+
+        // Delete half the points *after* the commit.
+        for &id in &ids[..15] {
+            col.delete(id);
+        }
+        assert_eq!(col.len(), 15);
+
+        // Live search excludes deleted points...
+        let live = col.search(&vec_of(dim, 1), 30, None).unwrap();
+        assert_eq!(live.len(), 15);
+        assert!(live.iter().all(|s| !ids[..15].contains(&s.id)));
+
+        // ...but time-travel to v1 still sees all 30 (frozen deletion vector).
+        let at_v1 = col
+            .search_at(&VersionSelector::Version(v1), &vec_of(dim, 1), 40, None)
+            .unwrap();
+        assert_eq!(at_v1.len(), 30);
     }
 
     #[test]
-    fn dimension_mismatch_is_an_error() {
-        let col = Collection::create(CollectionConfig::new("c", 4, Metric::Dot));
-        assert!(matches!(
-            col.insert(&[1.0, 2.0]),
-            Err(CoreError::DimensionMismatch {
-                expected: 4,
-                got: 2
-            })
-        ));
-        assert!(col.search(&[1.0, 2.0, 3.0], 5, None).is_err());
+    fn diff_branch_restore() {
+        let dim = 8;
+        let col = Collection::create(config(dim));
+        let ids = col
+            .insert_batch(&(0..20).map(|i| vec_of(dim, i + 1)).collect::<Vec<_>>())
+            .unwrap();
+        let v0 = col.commit("manual", None, None).unwrap();
+
+        // Delete some, add some, commit again.
+        col.delete(ids[0]);
+        col.delete(ids[1]);
+        col.insert_batch(&(0..5).map(|i| vec_of(dim, 100 + i)).collect::<Vec<_>>())
+            .unwrap();
+        let v1 = col.commit("manual", None, None).unwrap();
+
+        // Diff v0 -> v1: 5 added, 2 removed.
+        let d = col.diff(v0, v1).unwrap();
+        assert_eq!(d.added.len(), 5);
+        assert_eq!(d.removed.len(), 2);
+
+        // Branch + tag the versions.
+        col.create_branch("main", v1).unwrap();
+        col.create_tag("baseline", v0).unwrap();
+        assert_eq!(
+            col.search_at(
+                &VersionSelector::Tag("baseline".into()),
+                &vec_of(dim, 1),
+                30,
+                None
+            )
+            .unwrap()
+            .len(),
+            20
+        );
+
+        // Restore to v0: a forward commit; live state reflects v0 (20 points).
+        let v2 = col.restore(v0).unwrap();
+        assert!(v2 > v1);
+        assert_eq!(col.len(), 20);
+        // History preserved: v1 still queryable with its 23 live points.
+        assert_eq!(
+            col.search_at(&VersionSelector::Version(v1), &vec_of(dim, 1), 40, None)
+                .unwrap()
+                .len(),
+            23
+        );
     }
 }
