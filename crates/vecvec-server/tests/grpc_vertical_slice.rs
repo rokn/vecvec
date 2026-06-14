@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tonic::transport::Channel;
-use vecvec_core::{DistanceKernel, Metric, VectorStorage, brute_force_topk};
+use vecvec_core::{DistanceKernel, FsyncMode, Metric, VectorStorage, brute_force_topk};
 use vecvec_proto::pb;
 use vecvec_server::{Service, serve};
 
@@ -54,7 +54,8 @@ async fn create_upsert_query_over_grpc() {
     let metric = Metric::Cosine;
 
     // Start the server on an ephemeral port.
-    let service = Arc::new(Service::new(2, 8));
+    let data = tempfile::tempdir().unwrap();
+    let service = Arc::new(Service::open(data.path(), 2, 8, FsyncMode::Sync).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { serve(service, listener).await });
@@ -139,7 +140,8 @@ async fn create_upsert_query_over_grpc() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_map_to_grpc_status_codes() {
-    let service = Arc::new(Service::new(2, 8));
+    let data = tempfile::tempdir().unwrap();
+    let service = Arc::new(Service::open(data.path(), 2, 8, FsyncMode::Sync).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { serve(service, listener).await });
@@ -190,4 +192,68 @@ async fn errors_map_to_grpc_status_codes() {
     assert_eq!(bad_dim.code(), tonic::Code::InvalidArgument);
 
     server.abort();
+}
+
+/// M6: data written through one server instance is recovered by a fresh instance
+/// pointed at the same data directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_survives_server_restart() {
+    let data = tempfile::tempdir().unwrap();
+    let dim = 32usize;
+    let n = 200usize;
+
+    // First instance: create + upsert, then shut down.
+    {
+        let service = Arc::new(Service::open(data.path(), 2, 8, FsyncMode::Sync).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { serve(service, listener).await });
+        let channel = connect(addr).await;
+
+        pb::collections_client::CollectionsClient::new(channel.clone())
+            .create(pb::CreateCollectionRequest {
+                name: "emb".into(),
+                dim: dim as u32,
+                metric: pb::Metric::Cosine as i32,
+            })
+            .await
+            .unwrap();
+        let batch = pb::UpsertRequest {
+            collection: "emb".into(),
+            vectors: (0..n)
+                .map(|i| pb::Vector {
+                    values: vec_of(dim, i as u32 + 1),
+                })
+                .collect(),
+        };
+        let resp = pb::points_client::PointsClient::new(channel)
+            .upsert(tokio_stream::iter(vec![batch]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.inserted, n as u64);
+        server.abort();
+    }
+
+    // Second instance over the same data dir: the collection + points are recovered.
+    {
+        let service = Arc::new(Service::open(data.path(), 2, 8, FsyncMode::Sync).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { serve(service, listener).await });
+        let channel = connect(addr).await;
+
+        let resp = pb::query_client::QueryClient::new(channel)
+            .query(pb::QueryRequest {
+                collection: "emb".into(),
+                vector: vec_of(dim, 7),
+                k: n as u32,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        // All n points recovered and searchable.
+        assert_eq!(resp.results.len(), n);
+        server.abort();
+    }
 }

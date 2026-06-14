@@ -21,10 +21,10 @@ use crate::distance::Metric;
 use crate::error::{CoreError, Result};
 use crate::id::{GlobalId, SegmentId};
 use crate::index::{BoundedTopK, FilterContext, HnswConfig};
-use crate::segment::{AppendableSegment, SegmentSet};
+use crate::segment::{AppendableSegment, SealedSegment, SegmentSet};
 
 /// Static configuration of a collection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CollectionConfig {
     /// The collection name.
     pub name: String,
@@ -100,8 +100,48 @@ impl Collection {
         self.sealed.load().len()
     }
 
-    fn alloc_global_id(&self) -> GlobalId {
+    /// Allocates the next global id (used by the durability layer to assign ids
+    /// before logging an upsert).
+    pub(crate) fn alloc_global_id(&self) -> GlobalId {
         GlobalId::new(self.next_global_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Appends a vector under a *specific* global id, advancing the allocator past
+    /// it. This is the single in-memory upsert apply path, shared by live writes
+    /// (after the id is allocated and logged) and WAL recovery.
+    pub fn insert_with_id(&self, id: GlobalId, vector: &[f32]) -> Result<()> {
+        self.check_dim(vector)?;
+        self.appendable.write().append(id, vector);
+        self.next_global_id
+            .fetch_max(id.get() + 1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A point-in-time snapshot of the sealed segment set.
+    pub fn sealed_snapshot(&self) -> Arc<SegmentSet> {
+        self.sealed.load_full()
+    }
+
+    /// Replaces the sealed segment set (recovery only).
+    pub(crate) fn install_sealed(&self, segments: Vec<Arc<SealedSegment>>) {
+        self.sealed
+            .store(Arc::new(SegmentSet::from_sealed(segments)));
+    }
+
+    /// Sets the id allocators (recovery only).
+    pub(crate) fn set_allocators(&self, next_global: u64, next_segment: u64) {
+        self.next_global_id.store(next_global, Ordering::Relaxed);
+        self.next_segment_id.store(next_segment, Ordering::Relaxed);
+    }
+
+    /// The next global id that would be allocated.
+    pub fn next_global_id_value(&self) -> u64 {
+        self.next_global_id.load(Ordering::Relaxed)
+    }
+
+    /// The next segment id that would be allocated.
+    pub fn next_segment_id_value(&self) -> u64 {
+        self.next_segment_id.load(Ordering::Relaxed)
     }
 
     fn check_dim(&self, vector: &[f32]) -> Result<()> {

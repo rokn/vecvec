@@ -27,7 +27,7 @@ pub(crate) type KernelF32 = unsafe fn(&[f32], &[f32]) -> f32;
 pub(crate) type KernelU8 = unsafe fn(&[u8], &[u8]) -> i32;
 
 /// A vector-space distance/similarity metric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Metric {
     /// Cosine similarity, computed as a dot product over L2-normalized vectors.
     Cosine,

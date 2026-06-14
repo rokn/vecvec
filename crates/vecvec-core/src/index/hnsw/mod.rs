@@ -32,7 +32,7 @@ use crate::vector::VectorStorage;
 
 /// HNSW construction and search parameters. Defaults follow the values validated by
 /// the literature and Qdrant (see `BuildPlan.md`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct HnswConfig {
     /// Target out-degree on the upper layers.
     pub m: usize,

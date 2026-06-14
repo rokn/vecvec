@@ -19,6 +19,7 @@
 
 pub mod collection;
 pub mod distance;
+pub mod durable;
 pub mod error;
 pub mod id;
 pub mod index;
@@ -29,6 +30,7 @@ pub mod vector;
 
 pub use collection::{Collection, CollectionConfig, ScoredGlobal};
 pub use distance::{DistanceKernel, Metric};
+pub use durable::{DurableCollection, FsyncMode};
 pub use error::{CoreError, Result};
 pub use id::{GlobalId, LocalId, PointId, SegmentId, VersionId};
 pub use index::{

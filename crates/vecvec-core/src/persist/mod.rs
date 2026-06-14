@@ -6,5 +6,7 @@
 //! described in `BuildPlan.md` build on top of it in later milestones.
 
 pub mod atomic;
+pub mod wal;
 
 pub use atomic::{FileKind, Frame, FrameView, parse_framed, read_framed, write_atomic};
+pub use wal::{Wal, WalOp};

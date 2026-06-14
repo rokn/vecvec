@@ -22,6 +22,11 @@ impl SegmentSet {
         Self::default()
     }
 
+    /// Builds a set from a list of sealed segments (used on recovery).
+    pub(crate) fn from_sealed(sealed: Vec<Arc<SealedSegment>>) -> Self {
+        Self { sealed }
+    }
+
     /// The number of sealed segments.
     #[inline]
     pub fn len(&self) -> usize {

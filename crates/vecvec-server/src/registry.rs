@@ -1,23 +1,18 @@
 //! The collection registry.
 //!
-//! Maps collection names to live [`Collection`]s with lock-light concurrent access
-//! via [`DashMap`]. The full per-collection durability/versioning wiring layers on
-//! in later milestones; at M3 it just owns the in-RAM collections.
+//! Maps collection names to live, durable collections with lock-light concurrent
+//! access via [`DashMap`].
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use vecvec_core::{Collection, CollectionConfig};
+use vecvec_core::DurableCollection;
 
-/// Returned when creating a collection whose name is already taken.
-#[derive(Debug)]
-pub struct AlreadyExists(pub String);
-
-/// A concurrent map of collection name → collection.
+/// A concurrent map of collection name → durable collection.
 #[derive(Default)]
 pub struct Registry {
-    collections: DashMap<String, Arc<Collection>>,
+    collections: DashMap<String, Arc<DurableCollection>>,
 }
 
 impl Registry {
@@ -26,22 +21,20 @@ impl Registry {
         Self::default()
     }
 
-    /// Creates a collection, failing if the name already exists.
-    pub fn create(&self, config: CollectionConfig) -> Result<Arc<Collection>, AlreadyExists> {
-        let name = config.name.clone();
-        match self.collections.entry(name.clone()) {
-            Entry::Occupied(_) => Err(AlreadyExists(name)),
-            Entry::Vacant(slot) => {
-                let collection = Arc::new(Collection::create(config));
-                slot.insert(collection.clone());
-                Ok(collection)
-            }
-        }
+    /// Looks up a collection by name.
+    pub fn get(&self, name: &str) -> Option<Arc<DurableCollection>> {
+        self.collections.get(name).map(|r| r.value().clone())
     }
 
-    /// Looks up a collection by name.
-    pub fn get(&self, name: &str) -> Option<Arc<Collection>> {
-        self.collections.get(name).map(|r| r.value().clone())
+    /// Inserts a collection if the name is free; returns `false` if it was taken.
+    pub fn insert_new(&self, name: String, collection: Arc<DurableCollection>) -> bool {
+        match self.collections.entry(name) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(collection);
+                true
+            }
+        }
     }
 
     /// The number of collections.
