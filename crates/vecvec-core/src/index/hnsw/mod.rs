@@ -13,6 +13,7 @@
 mod builder;
 mod graph;
 mod heuristic;
+mod parallel;
 mod rng;
 mod search;
 mod visited;
@@ -75,6 +76,10 @@ impl Default for HnswConfig {
 /// Candidate over-fetch factor for quantized search before f32 rescore.
 const RESCORE_OVERSAMPLE: usize = 4;
 
+/// Below this point count, [`HnswIndex::build_parallel`] uses the sequential build:
+/// rayon's fan-out overhead isn't worth it and small graphs build sub-millisecond.
+const PARALLEL_MIN: usize = 4096;
+
 impl HnswConfig {
     /// The level-distribution constant `mL = 1/ln(M)`.
     #[inline]
@@ -107,6 +112,39 @@ impl HnswIndex {
             builder.insert(id, &mut visited);
         }
         let graph = builder.into_graph_layers();
+        let quantized = config
+            .quantization
+            .then(|| QuantizedVectorBlock::build(&vectors));
+        Self {
+            vectors,
+            kernel,
+            graph,
+            quantized,
+            deleted: SoftDeleteSet::new(),
+            config,
+            pool: VisitedPool::new(n.max(1)),
+        }
+    }
+
+    /// Builds an HNSW index, parallelizing graph construction across the rayon pool
+    /// for large inputs. Unlike [`HnswIndex::build`] the resulting graph is **not**
+    /// byte-deterministic — concurrent insertion order varies — so it is validated by
+    /// recall and structural invariants, not equality. Inputs below
+    /// [`PARALLEL_MIN`] delegate to the deterministic sequential build (pool overhead
+    /// isn't worth it, and tiny graphs build in microseconds).
+    pub fn build_parallel(vectors: Arc<VectorStorage>, config: HnswConfig) -> Self {
+        if vectors.len() < PARALLEL_MIN {
+            return Self::build(vectors, config);
+        }
+        Self::build_concurrent(vectors, config)
+    }
+
+    /// Always-concurrent build (no size threshold). Separated out so tests can drive
+    /// the parallel path at small `n` to cover its edge cases directly.
+    fn build_concurrent(vectors: Arc<VectorStorage>, config: HnswConfig) -> Self {
+        let kernel = DistanceKernel::new(vectors.metric(), vectors.dim());
+        let graph = parallel::build_concurrent_graph(vectors.clone(), kernel, config);
+        let n = vectors.len();
         let quantized = config
             .quantization
             .then(|| QuantizedVectorBlock::build(&vectors));
@@ -380,6 +418,144 @@ mod tests {
         for (p, expected) in before.iter().enumerate() {
             use super::search::Graph;
             assert_eq!(sealed.neighbors(p as u32, 0), expected.as_slice());
+        }
+    }
+
+    // ----- parallel (concurrent) build -----
+
+    /// Structural invariants every valid HNSW graph must satisfy regardless of how it
+    /// was built: degree bounds, no self-loops, in-range + present neighbors, no
+    /// duplicate edges, the entry sits at the top level, and (for n≥2) no point is
+    /// isolated on layer 0.
+    fn assert_valid_graph(index: &HnswIndex, n: usize) {
+        use super::search::Graph;
+        let g = index.graph();
+        let cfg = index.config();
+        assert_eq!(g.levels.len(), n);
+        if n == 0 {
+            assert!(g.entry.is_none());
+            return;
+        }
+        let entry = g.entry.expect("non-empty graph must have an entry");
+        assert_eq!(
+            g.levels[entry as usize] as usize,
+            g.max_level,
+            "entry must sit at the top level"
+        );
+        for p in 0..n as u32 {
+            let level = g.levels[p as usize] as usize;
+            for layer in 0..=level {
+                let nbrs = g.neighbors(p, layer);
+                let max_conn = if layer == 0 { cfg.m_max0 } else { cfg.m };
+                assert!(
+                    nbrs.len() <= max_conn,
+                    "point {p} layer {layer}: degree {} exceeds {max_conn}",
+                    nbrs.len()
+                );
+                let mut seen = std::collections::HashSet::new();
+                for &nb in nbrs {
+                    assert_ne!(nb, p, "self-loop at point {p} layer {layer}");
+                    assert!((nb as usize) < n, "neighbor {nb} out of range at point {p}");
+                    assert!(
+                        g.levels[nb as usize] as usize >= layer,
+                        "neighbor {nb} absent from layer {layer}"
+                    );
+                    assert!(seen.insert(nb), "duplicate edge {p}->{nb} at layer {layer}");
+                }
+            }
+            if n >= 2 {
+                assert!(
+                    !g.neighbors(p, 0).is_empty(),
+                    "point {p} is isolated on layer 0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_build_edge_cases() {
+        // Tiny counts exercise entry seeding, the empty/degenerate paths, and the
+        // small-n branches of insert without the size threshold.
+        for n in [0usize, 1, 2, 3, 5, 16, 100] {
+            for metric in [Metric::Cosine, Metric::Euclidean] {
+                let store = storage(8, n, metric);
+                let index = HnswIndex::build_concurrent(store, HnswConfig::default());
+                assert_valid_graph(&index, n);
+                if n > 0 {
+                    let got = index.search(&vec_of(8, 1), 5, SearchParams::default(), None);
+                    assert_eq!(got.len(), n.min(5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_build_handles_duplicate_vectors() {
+        // All-identical vectors: zero distances, lots of ties — must stay valid and
+        // still return k results.
+        let dim = 12;
+        let n = 500;
+        let mut s = VectorStorage::with_capacity(dim, Metric::Cosine, n);
+        for _ in 0..n {
+            s.push(&vec_of(dim, 42));
+        }
+        let index = HnswIndex::build_concurrent(Arc::new(s), HnswConfig::default());
+        assert_valid_graph(&index, n);
+        let got = index.search(&vec_of(dim, 42), 10, SearchParams::default(), None);
+        assert_eq!(got.len(), 10);
+    }
+
+    #[test]
+    fn concurrent_build_is_valid_and_matches_levels() {
+        // The concurrent build must assign the *same* per-point levels as the
+        // deterministic builder (levels are a pure function of seed^id), even though
+        // the adjacency differs.
+        let store = storage(24, 5_000, Metric::Cosine);
+        let seq = HnswIndex::build(store.clone(), HnswConfig::default());
+        let par = HnswIndex::build_concurrent(store, HnswConfig::default());
+        assert_valid_graph(&par, 5_000);
+        assert_eq!(seq.graph().levels, par.graph().levels, "levels must match");
+    }
+
+    #[test]
+    fn parallel_build_preserves_quality() {
+        // The headline correctness gate: parallelizing construction must not
+        // materially degrade recall vs the deterministic sequential build, on a graph
+        // large enough to cross PARALLEL_MIN and actually run concurrently. The
+        // parallel graph differs (nondeterministic insertion order) and may even beat
+        // sequential, so the comparison is one-sided. (Absolute recall on the
+        // synthetic `vec_of` set is metric-dependent — its euclidean distribution is
+        // adversarial for HNSW even sequentially — so the absolute target is asserted
+        // only on the well-behaved metrics; SIFT1M validates euclidean on real data.)
+        let dim = 24;
+        let n = 6_000;
+        let queries = 50;
+        for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
+            let store = storage(dim, n, metric);
+            let kernel = DistanceKernel::new(metric, dim);
+            let seq = HnswIndex::build(store.clone(), HnswConfig::default());
+            let par = HnswIndex::build_parallel(store.clone(), HnswConfig::default());
+            assert_valid_graph(&par, n);
+
+            let (mut seq_total, mut par_total) = (0.0f32, 0.0f32);
+            for q in 0..queries {
+                let query = vec_of(dim, 200_000 + q);
+                let truth = brute_force_topk(&store, &kernel, &query, 10, None, None);
+                seq_total += recall_at(&seq.search(&query, 10, SearchParams::default(), None), &truth);
+                par_total += recall_at(&par.search(&query, 10, SearchParams::default(), None), &truth);
+            }
+            let (seq_recall, par_recall) =
+                (seq_total / queries as f32, par_total / queries as f32);
+            assert!(
+                par_recall >= seq_recall - 0.05,
+                "metric={metric}: parallel recall {par_recall:.3} materially below sequential {seq_recall:.3}"
+            );
+            if matches!(metric, Metric::Cosine | Metric::Dot) {
+                assert!(
+                    par_recall >= 0.95,
+                    "metric={metric}: parallel recall@10 {par_recall:.3} < 0.95"
+                );
+            }
         }
     }
 }

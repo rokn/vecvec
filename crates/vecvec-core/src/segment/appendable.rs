@@ -110,10 +110,13 @@ impl AppendableSegment {
         )
     }
 
-    /// Seals this segment into an immutable, HNSW-backed [`SealedSegment`].
+    /// Seals this segment into an immutable, HNSW-backed [`SealedSegment`]. Graph
+    /// construction parallelizes across the rayon pool for large segments (see
+    /// [`HnswIndex::build_parallel`]); the result is approximate-equivalent to the
+    /// sequential build (validated by recall, not byte-identity).
     pub fn seal(self, id: SegmentId, config: HnswConfig) -> SealedSegment {
         let vectors = Arc::new(self.vectors);
-        let index = HnswIndex::build(vectors, config);
+        let index = HnswIndex::build_parallel(vectors, config);
         SealedSegment::from_index(id, Arc::new(index), self.ids)
     }
 }
