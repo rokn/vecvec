@@ -34,7 +34,7 @@ pub mod version;
 
 pub use collection::{Collection, CollectionConfig, ScoredGlobal};
 pub use distance::{DistanceKernel, Metric};
-pub use durable::{DurableCollection, FsyncMode};
+pub use durable::{DurableCollection, FsyncMode, import};
 pub use error::{CoreError, Result};
 pub use id::{GlobalId, LocalId, PointId, SegmentId, VersionId};
 pub use index::{

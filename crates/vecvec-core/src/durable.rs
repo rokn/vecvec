@@ -346,6 +346,20 @@ impl DurableCollection {
         Ok(merged)
     }
 
+    /// Exports the collection to a tar archive for backup / migration. Checkpoints
+    /// first so the archive is a self-contained, WAL-folded snapshot.
+    pub fn export(&self, out_path: impl AsRef<Path>) -> Result<()> {
+        self.checkpoint()?;
+        let out = out_path.as_ref();
+        let file = std::fs::File::create(out).map_err(|e| CoreError::io(out, e))?;
+        let mut builder = tar::Builder::new(file);
+        builder
+            .append_dir_all(".", &self.dir)
+            .map_err(|e| CoreError::io(&self.dir, e))?;
+        builder.finish().map_err(|e| CoreError::io(out, e))?;
+        Ok(())
+    }
+
     /// Runs a GC pass with the given retention, deleting orphaned segment files.
     pub fn gc(&self, retention: &crate::version::RetentionRules) -> Result<Vec<u64>> {
         let dropped = self.collection.gc(retention);
@@ -429,6 +443,20 @@ impl DurableCollection {
     }
 }
 
+/// Imports a collection from a tar archive (produced by
+/// [`DurableCollection::export`]) into `dest_dir`. Open the result with
+/// [`DurableCollection::open`].
+pub fn import(tar_path: impl AsRef<Path>, dest_dir: impl AsRef<Path>) -> Result<()> {
+    let tar_path = tar_path.as_ref();
+    let dest = dest_dir.as_ref();
+    std::fs::create_dir_all(dest).map_err(|e| CoreError::io(dest, e))?;
+    let file = std::fs::File::open(tar_path).map_err(|e| CoreError::io(tar_path, e))?;
+    tar::Archive::new(file)
+        .unpack(dest)
+        .map_err(|e| CoreError::io(dest, e))?;
+    Ok(())
+}
+
 /// Applies a single op to the in-memory collection. The one apply path shared by
 /// live writes and recovery.
 fn apply_op(collection: &Collection, op: &WalOp) {
@@ -509,6 +537,27 @@ mod tests {
             .search_at(&VersionSelector::Version(v1), &vecf(8, 1), 40, None)
             .unwrap();
         assert_eq!(at_v1.len(), 30);
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let src = tempfile::tempdir().unwrap();
+        let tar_dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        let tar = tar_dir.path().join("backup.tar");
+        {
+            let dc = DurableCollection::open(src.path(), cfg.clone(), FsyncMode::Sync).unwrap();
+            dc.upsert((0..50).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
+            dc.commit(Some("v0".into()), None).unwrap();
+            dc.export(&tar).unwrap();
+        }
+        // Import into a fresh directory and reopen.
+        let dest = tempfile::tempdir().unwrap();
+        import(&tar, dest.path()).unwrap();
+        let dc = DurableCollection::open(dest.path(), cfg, FsyncMode::Sync).unwrap();
+        assert_eq!(dc.len(), 50);
+        assert_eq!(dc.list_versions().len(), 1);
     }
 
     #[test]
