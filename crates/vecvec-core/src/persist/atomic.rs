@@ -127,7 +127,28 @@ pub fn write_atomic(
 /// on any integrity problem rather than panicking or returning wrong bytes.
 pub fn read_framed(path: &Path) -> Result<Frame> {
     let bytes = std::fs::read(path).map_err(|e| CoreError::io(path, e))?;
+    let view = parse_framed(&bytes, path)?;
+    Ok(Frame {
+        format_version: view.format_version,
+        kind: view.kind,
+        payload: view.payload.to_vec(),
+    })
+}
 
+/// A borrowed, validated view over framed bytes (e.g. from an mmap), avoiding a
+/// payload copy.
+pub struct FrameView<'a> {
+    /// The caller-defined payload format version.
+    pub format_version: u32,
+    /// The raw kind tag.
+    pub kind: u32,
+    /// The payload bytes, borrowed from the input.
+    pub payload: &'a [u8],
+}
+
+/// Validates `bytes` as a framed artifact and returns a borrowed view of the
+/// payload. `path` is used only for error messages.
+pub fn parse_framed<'a>(bytes: &'a [u8], path: &Path) -> Result<FrameView<'a>> {
     if bytes.len() < HEADER_LEN + FOOTER_LEN {
         return Err(CoreError::Corrupt {
             path: path.into(),
@@ -185,10 +206,10 @@ pub fn read_framed(path: &Path) -> Result<Frame> {
         });
     }
 
-    Ok(Frame {
+    Ok(FrameView {
         format_version,
         kind,
-        payload: bytes[HEADER_LEN..payload_end].to_vec(),
+        payload: &bytes[HEADER_LEN..payload_end],
     })
 }
 

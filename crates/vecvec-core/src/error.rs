@@ -77,6 +77,13 @@ pub enum CoreError {
         /// The dimensionality of the offending vector.
         got: usize,
     },
+
+    /// Encoding or decoding a serialized artifact failed.
+    #[error("serialization error: {detail}")]
+    Serialization {
+        /// What went wrong.
+        detail: String,
+    },
 }
 
 impl CoreError {

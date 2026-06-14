@@ -47,6 +47,28 @@ impl VectorStorage {
         }
     }
 
+    /// Reconstructs a store from a previously-stored flat buffer **without
+    /// re-normalizing** (the data is assumed already in stored form, e.g. loaded
+    /// from a sealed segment). `data.len()` must be a multiple of `dim`.
+    ///
+    /// # Panics
+    /// Panics if `dim == 0` or `data.len()` isn't a multiple of `dim`.
+    pub fn from_flat(dim: usize, metric: Metric, data: Vec<f32>) -> Self {
+        assert!(dim > 0, "vector dimensionality must be non-zero");
+        assert!(
+            data.len().is_multiple_of(dim),
+            "flat buffer length {} is not a multiple of dim {dim}",
+            data.len()
+        );
+        let count = data.len() / dim;
+        Self {
+            data,
+            dim,
+            metric,
+            count,
+        }
+    }
+
     /// The vector dimensionality.
     #[inline]
     pub const fn dim(&self) -> usize {

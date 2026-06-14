@@ -101,10 +101,48 @@ impl HnswIndex {
         }
     }
 
-    /// The sealed graph (exposed for determinism/seal tests).
-    #[cfg(test)]
+    /// Reconstructs an index from an already-built graph (e.g. loaded from disk),
+    /// without rebuilding. `deleted_locals` re-applies tombstones.
+    pub(crate) fn from_parts(
+        vectors: Arc<VectorStorage>,
+        config: HnswConfig,
+        graph: GraphLayers,
+        deleted_locals: &[u32],
+    ) -> Self {
+        let kernel = DistanceKernel::new(vectors.metric(), vectors.dim());
+        let n = vectors.len();
+        let deleted = SoftDeleteSet::new();
+        for &local in deleted_locals {
+            deleted.delete(PointId::new(local));
+        }
+        Self {
+            vectors,
+            kernel,
+            graph,
+            deleted,
+            config,
+            pool: VisitedPool::new(n.max(1)),
+        }
+    }
+
+    /// The sealed graph (for serialization and determinism/seal tests).
     pub(crate) fn graph(&self) -> &GraphLayers {
         &self.graph
+    }
+
+    /// The shared vector storage.
+    pub(crate) fn vectors(&self) -> &Arc<VectorStorage> {
+        &self.vectors
+    }
+
+    /// The construction config.
+    pub(crate) fn config(&self) -> HnswConfig {
+        self.config
+    }
+
+    /// The tombstone set.
+    pub(crate) fn deleted(&self) -> &SoftDeleteSet {
+        &self.deleted
     }
 }
 

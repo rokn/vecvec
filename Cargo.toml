@@ -22,6 +22,9 @@ crc32fast = "1.4"
 roaring = "0.10"
 arc-swap = "1"
 parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+memmap2 = "0.9"
 
 # --- server / gRPC stack (M3+) ---
 tonic = "0.14"

@@ -64,6 +64,25 @@ impl IdMap {
         self.global_to_local.get(&global).copied()
     }
 
+    /// The local→global mapping as a slice indexed by local id.
+    #[inline]
+    pub fn global_ids(&self) -> &[GlobalId] {
+        &self.local_to_global
+    }
+
+    /// Rebuilds an id map from a local→global list (e.g. when loading a segment).
+    pub fn from_global_ids(global_ids: Vec<GlobalId>) -> Self {
+        let global_to_local = global_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| (g, LocalId::new(i as u32)))
+            .collect();
+        Self {
+            local_to_global: global_ids,
+            global_to_local,
+        }
+    }
+
     /// The number of mapped points.
     #[inline]
     pub fn len(&self) -> usize {

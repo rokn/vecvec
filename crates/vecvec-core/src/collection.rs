@@ -20,7 +20,7 @@ use parking_lot::RwLock;
 use crate::distance::Metric;
 use crate::error::{CoreError, Result};
 use crate::id::{GlobalId, SegmentId};
-use crate::index::{BoundedTopK, FilterContext};
+use crate::index::{BoundedTopK, FilterContext, HnswConfig};
 use crate::segment::{AppendableSegment, SegmentSet};
 
 /// Static configuration of a collection.
@@ -32,15 +32,18 @@ pub struct CollectionConfig {
     pub dim: usize,
     /// Distance metric.
     pub metric: Metric,
+    /// HNSW parameters used when sealing segments.
+    pub hnsw: HnswConfig,
 }
 
 impl CollectionConfig {
-    /// Convenience constructor.
+    /// Convenience constructor with default HNSW parameters.
     pub fn new(name: impl Into<String>, dim: usize, metric: Metric) -> Self {
         Self {
             name: name.into(),
             dim,
             metric,
+            hnsw: HnswConfig::default(),
         }
     }
 }
@@ -178,9 +181,15 @@ impl Collection {
             }
         }
 
+        // Dedup by global id, keeping the best-scoring occurrence (results are
+        // already best-first). A global id can appear in more than one segment once
+        // updates exist (tombstone in the old segment + new row in the appendable);
+        // recency-aware resolution lands with the update path in M7.
+        let mut seen = std::collections::HashSet::new();
         Ok(merger
             .into_sorted()
             .into_iter()
+            .filter(|(id, _)| seen.insert(*id))
             .map(|(id, score)| ScoredGlobal { id, score })
             .collect())
     }
@@ -201,7 +210,7 @@ impl Collection {
         );
         drop(app);
 
-        let sealed_segment = Arc::new(frozen.seal(seg_id));
+        let sealed_segment = Arc::new(frozen.seal(seg_id, self.config.hnsw));
         self.sealed
             .rcu(|current| Arc::new(current.with_appended(sealed_segment.clone())));
         Some(seg_id)
@@ -256,10 +265,11 @@ mod tests {
         }
     }
 
-    /// Sealing part of the data exercises the cross-segment merge: results over
-    /// (sealed ∪ appendable) must equal the oracle over all vectors.
+    /// Sealing part of the data exercises the cross-segment merge over a sealed
+    /// (HNSW) segment + the appendable (flat). Results must recall the oracle's
+    /// top-k over all vectors, and contain one entry per id.
     #[test]
-    fn cross_segment_search_matches_oracle() {
+    fn cross_segment_search_recall() {
         let dim = 16;
         let metric = Metric::Dot;
         let n_first = 120;
@@ -278,11 +288,24 @@ mod tests {
         col.insert_batch(&second).unwrap();
         assert_eq!(col.len(), n_first + n_second);
 
-        let query = vec_of(dim, 5555);
-        let got = col.search(&query, 15, None).unwrap();
-        let want = oracle(dim, metric, n_first + n_second, &query, 15);
-        let got_pairs: Vec<(u64, f32)> = got.iter().map(|s| (s.id.get(), s.score)).collect();
-        assert_eq!(got_pairs, want);
+        let mut hits = 0usize;
+        let trials = 20usize;
+        let k = 15usize;
+        for q in 0..trials {
+            let query = vec_of(dim, 500_000 + q as u32);
+            let got = col.search(&query, k, None).unwrap();
+            // One entry per id.
+            let ids: std::collections::HashSet<u64> = got.iter().map(|s| s.id.get()).collect();
+            assert_eq!(ids.len(), got.len());
+            let want: std::collections::HashSet<u64> =
+                oracle(dim, metric, n_first + n_second, &query, k)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+            hits += got.iter().filter(|s| want.contains(&s.id.get())).count();
+        }
+        let recall = hits as f32 / (k * trials) as f32;
+        assert!(recall >= 0.85, "cross-segment recall@{k} {recall} < 0.85");
     }
 
     #[test]

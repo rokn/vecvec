@@ -1,49 +1,34 @@
 //! Immutable sealed segments.
 //!
 //! A sealed segment is the immutable, `Arc`-shared building block that versioning
-//! references by id — once sealed it is never mutated (except for soft-delete
-//! tombstones layered on top), which is what makes cheap structural-sharing
+//! references by id — once sealed it is never mutated except for soft-delete
+//! tombstones layered on top, which is what makes cheap structural-sharing
 //! snapshots possible (M7).
 //!
-//! At M3 a sealed segment still serves search by exact flat scan over its
-//! `Arc<VectorStorage>`. M5 replaces that with a built HNSW sub-index + `u8`
-//! quantization and an mmap-backed on-disk form, behind this same interface.
+//! As of M5 a sealed segment is backed by a built **HNSW** index (so sealed search
+//! is approximate-but-fast and matches the flat oracle within recall tolerance) and
+//! can be persisted to / loaded from disk (see [`codec`](super::codec) and
+//! [`SegmentStore`](super::SegmentStore)). True zero-copy mmap residency of the
+//! vector block is a later hardening step; today a loaded segment owns its data.
 
 use std::sync::Arc;
 
 use super::id_map::IdMap;
-use super::search::search_local;
-use crate::distance::{DistanceKernel, Metric};
+use crate::distance::Metric;
 use crate::id::{GlobalId, SegmentId};
-use crate::index::{FilterContext, SoftDeleteSet};
-use crate::vector::VectorStorage;
+use crate::index::{FilterContext, HnswIndex, Index, SearchParams};
 
-/// An immutable segment: vectors + id map are fixed; only tombstones can change.
+/// An immutable, HNSW-backed segment.
 pub struct SealedSegment {
     id: SegmentId,
-    vectors: Arc<VectorStorage>,
+    index: Arc<HnswIndex>,
     ids: IdMap,
-    deleted: SoftDeleteSet,
-    kernel: DistanceKernel,
 }
 
 impl SealedSegment {
-    /// Assembles a sealed segment from its parts (used by
-    /// [`AppendableSegment::seal`](super::AppendableSegment::seal)).
-    pub(crate) fn from_parts(
-        id: SegmentId,
-        vectors: VectorStorage,
-        ids: IdMap,
-        deleted: SoftDeleteSet,
-        kernel: DistanceKernel,
-    ) -> Self {
-        Self {
-            id,
-            vectors: Arc::new(vectors),
-            ids,
-            deleted,
-            kernel,
-        }
+    /// Assembles a sealed segment from a built index and its id map.
+    pub(crate) fn from_index(id: SegmentId, index: Arc<HnswIndex>, ids: IdMap) -> Self {
+        Self { id, index, ids }
     }
 
     /// The segment's stable id.
@@ -55,35 +40,42 @@ impl SealedSegment {
     /// The metric.
     #[inline]
     pub fn metric(&self) -> Metric {
-        self.vectors.metric()
+        self.index.vectors().metric()
     }
 
     /// The total number of rows (including tombstones).
     #[inline]
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.index.capacity()
     }
 
     /// Whether the segment has no rows.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.vectors.is_empty()
+        self.index.capacity() == 0
     }
 
     /// The number of live (non-tombstoned) rows.
     #[inline]
     pub fn live_len(&self) -> usize {
-        self.vectors
-            .len()
-            .saturating_sub(self.deleted.deleted_count())
+        self.index.live_len()
+    }
+
+    /// The underlying index (for serialization).
+    pub(crate) fn index(&self) -> &Arc<HnswIndex> {
+        &self.index
+    }
+
+    /// The id map (for serialization).
+    pub(crate) fn id_map(&self) -> &IdMap {
+        &self.ids
     }
 
     /// Tombstones the row for `global`, if present. Returns whether it was newly
-    /// deleted. (Interior-mutable: a sealed segment's tombstones are the one thing
-    /// that can change.)
+    /// deleted. (Interior-mutable: tombstones are the one thing that can change.)
     pub fn delete_global(&self, global: GlobalId) -> bool {
         match self.ids.to_local(global) {
-            Some(local) => self.deleted.delete(local.to_point()),
+            Some(local) => self.index.delete(local.to_point()),
             None => false,
         }
     }
@@ -97,26 +89,22 @@ impl SealedSegment {
     /// Whether `global` is present and live in this segment.
     pub fn contains_live(&self, global: GlobalId) -> bool {
         match self.ids.to_local(global) {
-            Some(local) => !self.deleted.is_deleted(local.to_point()),
+            Some(local) => !self.index.is_deleted(local.to_point()),
             None => false,
         }
     }
 
-    /// Exact top-k search, returning `(global_id, score)` best-first.
+    /// Exact-ish (HNSW) top-k search, returning `(global_id, score)` best-first.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         filter: Option<&dyn FilterContext>,
     ) -> Vec<(GlobalId, f32)> {
-        search_local(
-            &self.vectors,
-            &self.kernel,
-            &self.ids,
-            &self.deleted,
-            query,
-            k,
-            filter,
-        )
+        self.index
+            .search(query, k, SearchParams::default(), filter)
+            .into_iter()
+            .map(|sp| (self.ids.global_at(sp.id.to_local()), sp.score))
+            .collect()
     }
 }

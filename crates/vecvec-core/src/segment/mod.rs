@@ -6,12 +6,15 @@
 //! already-sealed segments by `Arc`. See `BuildPlan.md`.
 
 mod appendable;
+mod codec;
 mod id_map;
 mod sealed;
 mod search;
 mod set;
+mod store;
 
 pub use appendable::AppendableSegment;
 pub use id_map::IdMap;
 pub use sealed::SealedSegment;
 pub use set::SegmentSet;
+pub use store::SegmentStore;

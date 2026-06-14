@@ -7,12 +7,14 @@
 //! [`SealedSegment`](super::SealedSegment); from M5 sealing also builds an HNSW and
 //! quantizes. Until then a sealed segment simply keeps flat-scanning.
 
+use std::sync::Arc;
+
 use super::id_map::IdMap;
 use super::sealed::SealedSegment;
 use super::search::search_local;
 use crate::distance::{DistanceKernel, Metric};
-use crate::id::{GlobalId, LocalId, SegmentId};
-use crate::index::{FilterContext, SoftDeleteSet};
+use crate::id::{GlobalId, LocalId, PointId, SegmentId};
+use crate::index::{FilterContext, HnswConfig, HnswIndex, Index, SoftDeleteSet};
 use crate::vector::VectorStorage;
 
 /// A growable, in-RAM segment that accepts appends and serves exact search.
@@ -118,10 +120,15 @@ impl AppendableSegment {
         )
     }
 
-    /// Seals this segment into an immutable [`SealedSegment`] with id `id`,
-    /// consuming it.
-    pub fn seal(self, id: SegmentId) -> SealedSegment {
-        SealedSegment::from_parts(id, self.vectors, self.ids, self.deleted, self.kernel)
+    /// Seals this segment into an immutable, HNSW-backed [`SealedSegment`] with id
+    /// `id`, consuming it. Builds the graph and carries over any tombstones.
+    pub fn seal(self, id: SegmentId, config: HnswConfig) -> SealedSegment {
+        let vectors = Arc::new(self.vectors);
+        let index = HnswIndex::build(vectors, config);
+        for local in self.deleted.snapshot().iter() {
+            index.delete(PointId::new(local));
+        }
+        SealedSegment::from_index(id, Arc::new(index), self.ids)
     }
 }
 

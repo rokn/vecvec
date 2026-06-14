@@ -7,4 +7,4 @@
 
 pub mod atomic;
 
-pub use atomic::{FileKind, Frame, read_framed, write_atomic};
+pub use atomic::{FileKind, Frame, FrameView, parse_framed, read_framed, write_atomic};
