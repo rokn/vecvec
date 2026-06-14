@@ -29,10 +29,13 @@ pub(crate) fn candidates_to(
     ids: &[u32],
     higher: bool,
 ) -> Vec<(f32, u32)> {
-    let base_vec = vectors.get(PointId::new(base));
+    // SAFETY: `base` and every `id` are existing graph rows, so `< vectors.len()`.
+    let base_vec = unsafe { vectors.get_unchecked(PointId::new(base)) };
     ids.iter()
         .map(|&id| {
-            let s = kernel.score_f32(base_vec, vectors.get(PointId::new(id)));
+            let s = kernel.score_f32(base_vec, unsafe {
+                vectors.get_unchecked(PointId::new(id))
+            });
             (badness(s, higher), id)
         })
         .collect()
@@ -63,11 +66,12 @@ pub(crate) fn select_neighbors(
         if result.len() >= m {
             break;
         }
-        let e_vec = vectors.get(PointId::new(e));
+        // SAFETY: `e` and every selected `r` are existing graph rows (`< len`).
+        let e_vec = unsafe { vectors.get_unchecked(PointId::new(e)) };
         let mut keep = true;
         for &r in &result {
             let d_er = badness(
-                kernel.score_f32(e_vec, vectors.get(PointId::new(r))),
+                kernel.score_f32(e_vec, unsafe { vectors.get_unchecked(PointId::new(r)) }),
                 higher,
             );
             // e is closer to an already-selected neighbor than to the base -> prune.

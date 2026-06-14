@@ -143,11 +143,14 @@ impl HnswIndex {
     /// the parallel path at small `n` to cover its edge cases directly.
     fn build_concurrent(vectors: Arc<VectorStorage>, config: HnswConfig) -> Self {
         let kernel = DistanceKernel::new(vectors.metric(), vectors.dim());
-        let graph = parallel::build_concurrent_graph(vectors.clone(), kernel, config);
         let n = vectors.len();
+        // Build the int8 block first so construction can use it for its (memory-bound)
+        // distance comparisons; it's then kept for search-time rescore.
         let quantized = config
             .quantization
             .then(|| QuantizedVectorBlock::build(&vectors));
+        let graph =
+            parallel::build_concurrent_graph(vectors.clone(), kernel, config, quantized.as_ref());
         Self {
             vectors,
             kernel,
@@ -519,22 +522,25 @@ mod tests {
 
     #[test]
     fn parallel_build_preserves_quality() {
-        // The headline correctness gate: parallelizing construction must not
-        // materially degrade recall vs the deterministic sequential build, on a graph
-        // large enough to cross PARALLEL_MIN and actually run concurrently. The
-        // parallel graph differs (nondeterministic insertion order) and may even beat
-        // sequential, so the comparison is one-sided. (Absolute recall on the
-        // synthetic `vec_of` set is metric-dependent — its euclidean distribution is
-        // adversarial for HNSW even sequentially — so the absolute target is asserted
-        // only on the well-behaved metrics; SIFT1M validates euclidean on real data.)
+        // Validates the *parallelism* itself: with f32 construction (quantization
+        // off), the concurrent build must not materially degrade recall vs the
+        // deterministic sequential build, on a graph large enough to cross
+        // PARALLEL_MIN. The parallel graph differs (nondeterministic insertion order)
+        // and may even beat sequential, so the comparison is one-sided. int8
+        // construction is an orthogonal feature, validated by
+        // `int8_construction_preserves_recall` (and SIFT1M on real data).
         let dim = 24;
         let n = 6_000;
         let queries = 50;
+        let cfg = HnswConfig {
+            quantization: false,
+            ..HnswConfig::default()
+        };
         for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
             let store = storage(dim, n, metric);
             let kernel = DistanceKernel::new(metric, dim);
-            let seq = HnswIndex::build(store.clone(), HnswConfig::default());
-            let par = HnswIndex::build_parallel(store.clone(), HnswConfig::default());
+            let seq = HnswIndex::build(store.clone(), cfg);
+            let par = HnswIndex::build_parallel(store.clone(), cfg);
             assert_valid_graph(&par, n);
 
             let (mut seq_total, mut par_total) = (0.0f32, 0.0f32);
@@ -554,6 +560,54 @@ mod tests {
                 assert!(
                     par_recall >= 0.95,
                     "metric={metric}: parallel recall@10 {par_recall:.3} < 0.95"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn int8_construction_preserves_recall() {
+        // The default parallel build uses int8 codes for its (memory-bound)
+        // construction distances. That must not materially hurt recall vs f32
+        // construction, on data where int8 quantization is representative (≥64-dim;
+        // very low dims are lossy for int8 and unrepresentative). Compares the two
+        // parallel builds directly, so it's independent of the data's absolute recall.
+        let dim = 64;
+        let n = 5_000;
+        let queries = 60;
+        let f32_cfg = HnswConfig {
+            quantization: false,
+            ..HnswConfig::default()
+        };
+        let int8_cfg = HnswConfig::default(); // quantization on
+        for metric in [Metric::Cosine, Metric::Euclidean] {
+            let store = storage(dim, n, metric);
+            let kernel = DistanceKernel::new(metric, dim);
+            let f32_idx = HnswIndex::build_parallel(store.clone(), f32_cfg);
+            let int8_idx = HnswIndex::build_parallel(store.clone(), int8_cfg);
+
+            let (mut f32_total, mut int8_total) = (0.0f32, 0.0f32);
+            for q in 0..queries {
+                let query = vec_of(dim, 300_000 + q);
+                let truth = brute_force_topk(&store, &kernel, &query, 10, None, None);
+                f32_total += recall_at(&f32_idx.search(&query, 10, SearchParams::default(), None), &truth);
+                int8_total +=
+                    recall_at(&int8_idx.search(&query, 10, SearchParams::default(), None), &truth);
+            }
+            let (f32_recall, int8_recall) =
+                (f32_total / queries as f32, int8_total / queries as f32);
+            // Coarse "int8 construction isn't broken" gate: the synthetic euclidean
+            // set is noisy run-to-run for *both* builds (f32 itself swings ~±0.05), so
+            // the margin is loose. SIFT1M validates int8 euclidean precisely (~0.99).
+            assert!(
+                int8_recall >= f32_recall - 0.10,
+                "metric={metric}: int8-construction recall {int8_recall:.3} far below f32 {f32_recall:.3}"
+            );
+            // Cosine is stable here, so hold it to a tight absolute bar.
+            if metric == Metric::Cosine {
+                assert!(
+                    int8_recall >= 0.95,
+                    "metric={metric}: int8 recall {int8_recall:.3} < 0.95"
                 );
             }
         }

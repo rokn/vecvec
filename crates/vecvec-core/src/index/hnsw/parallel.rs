@@ -20,17 +20,17 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::distance::DistanceKernel;
 use crate::id::PointId;
 use crate::ordered::OrderedF32;
+use crate::quantization::QuantizedVectorBlock;
 use crate::vector::VectorStorage;
 
 use super::HnswConfig;
 use super::graph::GraphLayers;
-use super::heuristic::{candidates_to, select_neighbors};
 use super::rng::level_for;
 use super::visited::VisitedList;
 
@@ -41,27 +41,39 @@ struct EntryState {
 }
 
 /// A builder that inserts points concurrently, guarding per-point adjacency.
-struct ConcurrentBuilder {
+///
+/// All construction distances go through [`ConcurrentBuilder::dist_ids`]: when an
+/// int8 [`QuantizedVectorBlock`] is supplied, comparisons read 4×-smaller codes,
+/// which is a large win because the build is memory-latency/bandwidth-bound. The f32
+/// rescore at *search* time recovers the precision lost during construction.
+struct ConcurrentBuilder<'q> {
     vectors: Arc<VectorStorage>,
     kernel: DistanceKernel,
     config: HnswConfig,
     higher: bool,
+    /// Optional int8 codes used for the (memory-bound) construction distances.
+    quant: Option<&'q QuantizedVectorBlock>,
     levels: Vec<u8>,
     /// `links[point]` (locked) holds the point's neighbor lists, indexed by layer.
-    links: Vec<Mutex<Vec<Vec<u32>>>>,
+    links: Vec<RwLock<Vec<Vec<u32>>>>,
     entry: RwLock<EntryState>,
 }
 
-impl ConcurrentBuilder {
-    fn new(vectors: Arc<VectorStorage>, kernel: DistanceKernel, config: HnswConfig) -> Self {
+impl<'q> ConcurrentBuilder<'q> {
+    fn new(
+        vectors: Arc<VectorStorage>,
+        kernel: DistanceKernel,
+        config: HnswConfig,
+        quant: Option<&'q QuantizedVectorBlock>,
+    ) -> Self {
         let n = vectors.len();
         let ml = config.ml();
         let levels: Vec<u8> = (0..n)
             .map(|i| level_for(i as u32, config.seed, ml) as u8)
             .collect();
-        let links: Vec<Mutex<Vec<Vec<u32>>>> = levels
+        let links: Vec<RwLock<Vec<Vec<u32>>>> = levels
             .iter()
-            .map(|&lv| Mutex::new(vec![Vec::new(); lv as usize + 1]))
+            .map(|&lv| RwLock::new(vec![Vec::new(); lv as usize + 1]))
             .collect();
         let higher = kernel.metric().higher_is_better();
         Self {
@@ -69,6 +81,7 @@ impl ConcurrentBuilder {
             kernel,
             config,
             higher,
+            quant,
             levels,
             links,
             entry: RwLock::new(EntryState {
@@ -85,6 +98,67 @@ impl ConcurrentBuilder {
         } else {
             self.config.m
         }
+    }
+
+    /// Construction "badness" (smaller = closer) between two stored points by id,
+    /// using int8 codes when available, else the f32 kernel.
+    #[inline]
+    fn dist_ids(&self, a: u32, b: u32) -> f32 {
+        if let Some(q) = self.quant {
+            // SAFETY: `a`/`b` are existing graph rows (`< len`).
+            unsafe { q.badness_between(a, b) }
+        } else {
+            // SAFETY: same in-range invariant.
+            let (va, vb) = unsafe {
+                (
+                    self.vectors.get_unchecked(PointId::new(a)),
+                    self.vectors.get_unchecked(PointId::new(b)),
+                )
+            };
+            let s = self.kernel.score_f32(va, vb);
+            if self.higher { -s } else { s }
+        }
+    }
+
+    /// Alg-4 neighbor selection over `candidates` (`(badness_to_base, id)`), using
+    /// id-based distances (so it honors `dist_ids`'s int8/f32 choice). Mirrors
+    /// [`super::heuristic::select_neighbors`].
+    fn select_ids(&self, base: u32, candidates: &[(f32, u32)], m: usize) -> Vec<u32> {
+        let mut sorted: Vec<(OrderedF32, u32)> = candidates
+            .iter()
+            .filter(|&&(_, id)| id != base)
+            .map(|&(b, id)| (OrderedF32::new(b), id))
+            .collect();
+        sorted.sort_unstable();
+
+        let mut result: Vec<u32> = Vec::with_capacity(m);
+        let mut discarded: Vec<u32> = Vec::new();
+        for (dist_to_base, e) in sorted {
+            if result.len() >= m {
+                break;
+            }
+            let mut keep = true;
+            for &r in &result {
+                if self.dist_ids(e, r) < dist_to_base.into_inner() {
+                    keep = false;
+                    break;
+                }
+            }
+            if keep {
+                result.push(e);
+            } else if self.config.keep_pruned {
+                discarded.push(e);
+            }
+        }
+        if self.config.keep_pruned {
+            for e in discarded {
+                if result.len() >= m {
+                    break;
+                }
+                result.push(e);
+            }
+        }
+        result
     }
 
     /// Best-first beam search of one `layer` over the (concurrently mutating) graph.
@@ -124,7 +198,7 @@ impl ConcurrentBuilder {
             }
             nbuf.clear();
             {
-                let g = self.links[c as usize].lock();
+                let g = self.links[c as usize].read();
                 if let Some(v) = g.get(layer) {
                     nbuf.extend_from_slice(v);
                 }
@@ -157,16 +231,9 @@ impl ConcurrentBuilder {
     fn enforce_bound(&self, base: u32, layer: usize, list: &mut Vec<u32>) {
         let max_conn = self.max_conn(layer);
         if list.len() > max_conn {
-            let cand = candidates_to(&self.vectors, &self.kernel, base, list, self.higher);
-            *list = select_neighbors(
-                &self.vectors,
-                &self.kernel,
-                base,
-                &cand,
-                max_conn,
-                self.config.keep_pruned,
-                self.higher,
-            );
+            let cand: Vec<(f32, u32)> =
+                list.iter().map(|&id| (self.dist_ids(base, id), id)).collect();
+            *list = self.select_ids(base, &cand, max_conn);
         }
     }
 
@@ -182,15 +249,9 @@ impl ConcurrentBuilder {
             }
         };
 
-        // Self-contained distance closure (owns its captures; holds no lock).
-        let kernel = self.kernel;
-        let vectors = self.vectors.clone();
-        let query = vectors.get(PointId::new(point)).to_vec();
-        let higher = self.higher;
-        let dist = move |id: u32| {
-            let s = kernel.score_f32(&query, vectors.get(PointId::new(id)));
-            if higher { -s } else { s }
-        };
+        // Distance closure: all construction distances go through `dist_ids`, which
+        // uses int8 codes when available (the memory-bound win).
+        let dist = |id: u32| self.dist_ids(point, id);
 
         // Phase 1: greedy descent from the (snapshotted) top to just above `level`.
         let mut ep = vec![entry];
@@ -206,21 +267,13 @@ impl ConcurrentBuilder {
         for layer in (0..=top).rev() {
             let w = self.search_layer(layer, &ep, self.config.ef_construction, &dist, visited, nbuf);
             let max_conn = self.max_conn(layer);
-            let selected = select_neighbors(
-                &self.vectors,
-                &self.kernel,
-                point,
-                &w,
-                max_conn,
-                self.config.keep_pruned,
-                self.higher,
-            );
+            let selected = self.select_ids(point, &w, max_conn);
 
             // Our own links: merge with any back-links already pushed concurrently,
             // then re-bound. Merging (not overwriting) is what makes the parallel
             // build lose no edges.
             {
-                let mut own = self.links[point as usize].lock();
+                let mut own = self.links[point as usize].write();
                 let list = &mut own[layer];
                 for &s in &selected {
                     if !list.contains(&s) {
@@ -230,9 +283,10 @@ impl ConcurrentBuilder {
                 self.enforce_bound(point, layer, list);
             }
 
-            // Reverse links: push us onto each selected neighbor, re-bounding it.
+            // Reverse links: push us onto each selected neighbor, re-bounding it with
+            // the full Alg-4 heuristic (its diversity is essential for recall).
             for &nb in &selected {
-                let mut g = self.links[nb as usize].lock();
+                let mut g = self.links[nb as usize].write();
                 if !g[layer].contains(&point) {
                     g[layer].push(point);
                 }
@@ -295,14 +349,16 @@ impl ConcurrentBuilder {
 
 /// Builds an HNSW [`GraphLayers`] by parallel insertion across the rayon pool.
 /// Point 0 seeds the entry sequentially (it has no links, like the sequential
-/// builder's first insert); the rest are inserted concurrently.
+/// builder's first insert); the rest are inserted concurrently. When `quant` is
+/// supplied, construction distances use its int8 codes (memory-bound speedup).
 pub(crate) fn build_concurrent_graph(
     vectors: Arc<VectorStorage>,
     kernel: DistanceKernel,
     config: HnswConfig,
+    quant: Option<&QuantizedVectorBlock>,
 ) -> GraphLayers {
     let n = vectors.len();
-    let builder = ConcurrentBuilder::new(vectors, kernel, config);
+    let builder = ConcurrentBuilder::new(vectors, kernel, config, quant);
     if n == 0 {
         return builder.into_graph_layers();
     }

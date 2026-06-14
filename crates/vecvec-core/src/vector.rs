@@ -126,6 +126,19 @@ impl VectorStorage {
         &self.data[start..start + self.dim]
     }
 
+    /// Returns the stored vector for `id` without bounds checks. Hot-path accessor for
+    /// index construction/search, where ids come from the graph and are guaranteed
+    /// `< len()`.
+    ///
+    /// # Safety
+    /// `id.get()` must be `< self.len()`.
+    #[inline]
+    pub(crate) unsafe fn get_unchecked(&self, id: PointId) -> &[f32] {
+        let start = id.get() as usize * self.dim;
+        // SAFETY: caller guarantees `id < len`, so `[start, start+dim)` is in bounds.
+        unsafe { self.data.get_unchecked(start..start + self.dim) }
+    }
+
     /// Iterates over `(id, vector)` pairs in id order.
     pub fn iter(&self) -> impl Iterator<Item = (PointId, &[f32])> {
         self.data

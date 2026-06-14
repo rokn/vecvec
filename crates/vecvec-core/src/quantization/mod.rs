@@ -8,6 +8,8 @@
 //! both the int dot product and the int squared-L2 are *monotonic* with their f32
 //! counterparts, so ranking is preserved and the rescore fixes the final top-k.
 
+use rayon::prelude::*;
+
 use crate::distance::{DistanceKernel, Metric};
 use crate::id::PointId;
 use crate::index::ScoredPoint;
@@ -25,8 +27,9 @@ impl ScalarQuantizer {
     pub fn fit(storage: &VectorStorage) -> Self {
         let max_abs = storage
             .as_flat()
-            .iter()
-            .fold(0.0f32, |m, &x| m.max(x.abs()));
+            .par_iter()
+            .fold(|| 0.0f32, |m, &x| m.max(x.abs()))
+            .reduce(|| 0.0f32, f32::max);
         let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
         Self { scale }
     }
@@ -53,6 +56,15 @@ impl ScalarQuantizer {
         self.encode_into(vector, &mut out);
         out
     }
+
+    /// Encodes `vector` into the `out` slice (same length).
+    #[inline]
+    pub fn encode_slice(&self, vector: &[f32], out: &mut [i8]) {
+        let inv = 1.0 / self.scale;
+        for (o, &x) in out.iter_mut().zip(vector) {
+            *o = (x * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
 }
 
 /// A contiguous block of int8-quantized vectors.
@@ -68,12 +80,11 @@ impl QuantizedVectorBlock {
     pub fn build(storage: &VectorStorage) -> Self {
         let quantizer = ScalarQuantizer::fit(storage);
         let dim = storage.dim();
-        let mut data = Vec::with_capacity(storage.len() * dim);
-        let mut scratch = Vec::with_capacity(dim);
-        for (_, v) in storage.iter() {
-            quantizer.encode_into(v, &mut scratch);
-            data.extend_from_slice(&scratch);
-        }
+        let mut data = vec![0i8; storage.len() * dim];
+        // Encode rows in parallel (this is on the index-build critical path).
+        data.par_chunks_mut(dim)
+            .zip(storage.as_flat().par_chunks(dim))
+            .for_each(|(out, v)| quantizer.encode_slice(v, out));
         Self {
             data,
             dim,
@@ -123,8 +134,33 @@ impl QuantizedVectorBlock {
             Metric::Euclidean => sq_l2_i8(quantized_query, stored) as f32,
         }
     }
+
+    /// Badness between two *stored* points by id, in the quantized metric. Reads two
+    /// int8 codes (4× smaller than the f32 rows), used to keep graph construction's
+    /// memory-bound distance loop in cache.
+    ///
+    /// # Safety
+    /// `a` and `b` must be `< self.len()`.
+    #[inline]
+    pub(crate) unsafe fn badness_between(&self, a: u32, b: u32) -> f32 {
+        let da = a as usize * self.dim;
+        let db = b as usize * self.dim;
+        // SAFETY: caller guarantees both ids are in range.
+        let (va, vb) = unsafe {
+            (
+                self.data.get_unchecked(da..da + self.dim),
+                self.data.get_unchecked(db..db + self.dim),
+            )
+        };
+        match self.metric {
+            Metric::Cosine | Metric::Dot => -(dot_i8(va, vb) as f32),
+            Metric::Euclidean => sq_l2_i8(va, vb) as f32,
+        }
+    }
 }
 
+// The simple scalar reductions auto-vectorize well (LLVM beats a hand-rolled NEON
+// version here, which was measurably slower — see the Opt8 experiment).
 #[inline]
 fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     a.iter()
