@@ -35,6 +35,21 @@ pub enum ServiceError {
     Bridge(#[from] BridgeError),
 }
 
+/// Summary stats for a collection (powers the explorer's collection list + header).
+#[derive(Debug, Clone)]
+pub struct CollectionStats {
+    /// The collection name.
+    pub name: String,
+    /// Vector dimensionality.
+    pub dim: usize,
+    /// Distance metric.
+    pub metric: Metric,
+    /// The number of live points.
+    pub count: usize,
+    /// The current HEAD version, if any commits exist.
+    pub head_version: Option<u64>,
+}
+
 /// The transport-agnostic service facade.
 pub struct Service {
     registry: Registry,
@@ -256,5 +271,85 @@ impl Service {
         let durable = self.get(collection)?;
         let diff = durable.diff(from, to)?;
         Ok((diff.added, diff.removed))
+    }
+
+    /// Lists every collection with its summary stats (name, dim, metric, count, head),
+    /// ordered by name.
+    pub fn list_collections(&self) -> Vec<CollectionStats> {
+        let mut out: Vec<CollectionStats> = self
+            .registry
+            .list_all()
+            .into_iter()
+            .map(|(name, c)| {
+                let cfg = c.config();
+                CollectionStats {
+                    name,
+                    dim: cfg.dim,
+                    metric: cfg.metric,
+                    count: c.len(),
+                    head_version: c.head_version(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Summary stats for a single collection.
+    pub fn collection_stats(&self, collection: &str) -> Result<CollectionStats, ServiceError> {
+        let durable = self.get(collection)?;
+        let cfg = durable.config();
+        Ok(CollectionStats {
+            name: cfg.name.clone(),
+            dim: cfg.dim,
+            metric: cfg.metric,
+            count: durable.len(),
+            head_version: durable.head_version(),
+        })
+    }
+
+    /// Drops a collection: removes it from the registry and deletes its data on disk.
+    pub fn drop_collection(&self, collection: &str) -> Result<(), ServiceError> {
+        if self.registry.remove(collection).is_none() {
+            return Err(ServiceError::NotFound(collection.to_owned()));
+        }
+        let dir = self.collections_dir().join(collection);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(vecvec_core::CoreError::from)?;
+        }
+        Ok(())
+    }
+
+    /// Materializes a page of live points (vectors + payloads), optionally as of a
+    /// past version. Returns `(page, total_live_count)`. Backs the table + graph view.
+    pub async fn scroll(
+        &self,
+        collection: String,
+        at: Option<VersionSelector>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<vecvec_core::PointRecord>, usize), ServiceError> {
+        let durable = self.get(&collection)?;
+        let page = self
+            .bridge
+            .run(move || durable.scroll(at.as_ref(), offset, limit))
+            .await??;
+        Ok(page)
+    }
+
+    /// Fetches a single live point (vector + payload) by id.
+    pub fn get_point(
+        &self,
+        collection: &str,
+        id: u64,
+    ) -> Result<Option<vecvec_core::PointRecord>, ServiceError> {
+        let durable = self.get(collection)?;
+        Ok(durable.get_point(id))
+    }
+
+    /// Durably tombstones a point, returning whether it was newly deleted.
+    pub async fn delete(&self, collection: String, id: u64) -> Result<bool, ServiceError> {
+        let durable = self.get(&collection)?;
+        Ok(self.bridge.run(move || durable.delete(id)).await??)
     }
 }

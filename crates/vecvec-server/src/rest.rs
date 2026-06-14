@@ -9,29 +9,87 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, response::Response};
 use serde::Deserialize;
 use serde_json::json;
-use vecvec_core::Metric;
 use vecvec_core::version::VersionSelector;
+use vecvec_core::{Metric, PointRecord};
 
-use crate::service::{Service, ServiceError};
+use crate::service::{CollectionStats, Service, ServiceError};
 
 /// Builds the REST router over a shared [`Service`].
 pub fn router(service: Arc<Service>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/collections/{name}", post(create_collection))
-        .route("/collections/{name}/points", post(upsert))
+        .route("/collections", get(list_collections))
+        .route(
+            "/collections/{name}",
+            post(create_collection)
+                .get(collection_stats)
+                .delete(drop_collection),
+        )
+        .route(
+            "/collections/{name}/points",
+            post(upsert).get(scroll_points),
+        )
+        .route(
+            "/collections/{name}/points/{id}",
+            get(get_point).delete(delete_point),
+        )
         .route("/collections/{name}/query", post(query))
         .route("/collections/{name}/recommend", post(recommend))
         .route("/collections/{name}/commit", post(commit))
         .route("/collections/{name}/versions", get(list_versions))
+        .route("/collections/{name}/diff", get(diff))
+        .route("/collections/{name}/tags", post(create_tag))
+        .route("/collections/{name}/branches", post(create_branch))
+        .route("/collections/{name}/restore", post(restore))
+        .layer(middleware::from_fn(cors))
         .with_state(service)
+}
+
+/// Permissive CORS for local browser tooling: adds `Access-Control-*` headers and
+/// short-circuits preflight `OPTIONS` requests. Dependency-free so it doesn't pull a
+/// new crate into the server build.
+async fn cors(req: Request, next: Next) -> Response {
+    let preflight = req.method() == Method::OPTIONS;
+    let mut res = if preflight {
+        Response::new(Body::empty())
+    } else {
+        next.run(req).await
+    };
+    let h = res.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        "GET,POST,DELETE,OPTIONS".parse().unwrap(),
+    );
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, "*".parse().unwrap());
+    res
+}
+
+fn stats_json(s: &CollectionStats) -> serde_json::Value {
+    json!({
+        "name": s.name,
+        "dim": s.dim,
+        "metric": s.metric.as_str(),
+        "count": s.count,
+        "head_version": s.head_version,
+    })
+}
+
+fn point_json(p: &PointRecord) -> serde_json::Value {
+    json!({
+        "id": p.id.get(),
+        "vector": p.vector,
+        "payload": p.payload,
+    })
 }
 
 fn err(e: ServiceError) -> Response {
@@ -217,6 +275,156 @@ async fn list_versions(State(svc): State<Arc<Service>>, Path(name): Path<String>
                 .collect();
             Json(json!({ "versions": versions, "head": head })).into_response()
         }
+        Err(e) => err(e),
+    }
+}
+
+async fn list_collections(State(svc): State<Arc<Service>>) -> Response {
+    let collections: Vec<_> = svc.list_collections().iter().map(stats_json).collect();
+    Json(json!({ "collections": collections })).into_response()
+}
+
+async fn collection_stats(State(svc): State<Arc<Service>>, Path(name): Path<String>) -> Response {
+    match svc.collection_stats(&name) {
+        Ok(s) => Json(stats_json(&s)).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn drop_collection(State(svc): State<Arc<Service>>, Path(name): Path<String>) -> Response {
+    match svc.drop_collection(&name) {
+        Ok(()) => Json(json!({ "dropped": name })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ScrollParams {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    #[serde(default)]
+    version: Option<u64>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+fn default_limit() -> usize {
+    2000
+}
+
+impl ScrollParams {
+    fn selector(&self) -> Option<VersionSelector> {
+        if let Some(v) = self.version {
+            Some(VersionSelector::Version(v))
+        } else if let Some(t) = &self.tag {
+            Some(VersionSelector::Tag(t.clone()))
+        } else {
+            self.branch.clone().map(VersionSelector::Branch)
+        }
+    }
+}
+
+async fn scroll_points(
+    State(svc): State<Arc<Service>>,
+    Path(name): Path<String>,
+    Query(params): Query<ScrollParams>,
+) -> Response {
+    let at = params.selector();
+    match svc.scroll(name, at, params.offset, params.limit).await {
+        Ok((points, total)) => {
+            let points: Vec<_> = points.iter().map(point_json).collect();
+            Json(json!({ "points": points, "total": total })).into_response()
+        }
+        Err(e) => err(e),
+    }
+}
+
+async fn get_point(
+    State(svc): State<Arc<Service>>,
+    Path((name, id)): Path<(String, u64)>,
+) -> Response {
+    match svc.get_point(&name, id) {
+        Ok(Some(p)) => Json(point_json(&p)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("point {id} not found") })),
+        )
+            .into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn delete_point(
+    State(svc): State<Arc<Service>>,
+    Path((name, id)): Path<(String, u64)>,
+) -> Response {
+    match svc.delete(name, id).await {
+        Ok(deleted) => Json(json!({ "deleted": deleted, "id": id })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DiffParams {
+    from: u64,
+    to: u64,
+}
+
+async fn diff(
+    State(svc): State<Arc<Service>>,
+    Path(name): Path<String>,
+    Query(params): Query<DiffParams>,
+) -> Response {
+    match svc.diff(&name, params.from, params.to) {
+        Ok((added, removed)) => Json(json!({ "added": added, "removed": removed })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RefReq {
+    name: String,
+    version: u64,
+}
+
+async fn create_tag(
+    State(svc): State<Arc<Service>>,
+    Path(name): Path<String>,
+    Json(req): Json<RefReq>,
+) -> Response {
+    match svc.create_tag(name, req.name.clone(), req.version).await {
+        Ok(()) => Json(json!({ "tag": req.name, "version": req.version })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn create_branch(
+    State(svc): State<Arc<Service>>,
+    Path(name): Path<String>,
+    Json(req): Json<RefReq>,
+) -> Response {
+    match svc.create_branch(name, req.name.clone(), req.version).await {
+        Ok(()) => Json(json!({ "branch": req.name, "version": req.version })).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RestoreReq {
+    version: u64,
+}
+
+async fn restore(
+    State(svc): State<Arc<Service>>,
+    Path(name): Path<String>,
+    Json(req): Json<RestoreReq>,
+) -> Response {
+    match svc.restore(name, req.version).await {
+        Ok(version) => Json(json!({ "version": version })).into_response(),
         Err(e) => err(e),
     }
 }

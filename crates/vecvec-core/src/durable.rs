@@ -226,6 +226,27 @@ impl DurableCollection {
         self.collection.is_empty()
     }
 
+    /// A page of live points (vectors + payloads), optionally as of a past version.
+    /// Returns `(page, total_live_count)`. Backs the explorer table + 2D graph view.
+    pub fn scroll(
+        &self,
+        at: Option<&crate::version::VersionSelector>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<crate::collection::PointRecord>, usize)> {
+        self.collection.scroll(at, offset, limit)
+    }
+
+    /// A single live point by id (vector + payload), or `None` if missing/deleted.
+    pub fn get_point(&self, id: u64) -> Option<crate::collection::PointRecord> {
+        self.collection.get_point(GlobalId::new(id))
+    }
+
+    /// The current HEAD version, if any.
+    pub fn head_version(&self) -> Option<u64> {
+        self.collection.head_version()
+    }
+
     /// Durably appends a batch of `(vector, payload)` points, returning their ids.
     /// WAL-first: logged + fsynced before applied in memory.
     pub fn upsert(&self, points: Vec<(Vec<f32>, Option<Payload>)>) -> Result<Vec<u64>> {

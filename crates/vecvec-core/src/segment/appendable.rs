@@ -81,6 +81,14 @@ impl AppendableSegment {
             .map(|local| self.vectors.get(local.to_point()))
     }
 
+    /// Iterates `(global_id, vector)` for every row (used by the explorer scroll).
+    pub(crate) fn iter_points(&self) -> impl Iterator<Item = (GlobalId, &[f32])> {
+        (0..self.vectors.len() as u32).map(move |local| {
+            let lid = LocalId::new(local);
+            (self.ids.global_at(lid), self.vectors.get(lid.to_point()))
+        })
+    }
+
     /// The inclusive global-id range this segment spans, or `None` if empty.
     pub fn global_id_range(&self) -> Option<(u64, u64)> {
         let ids = self.ids.global_ids();
