@@ -5,17 +5,31 @@ versioning** of collections (immutable snapshots, time-travel query, branch, dif
 restore) on top of an HNSW index. See [BuildPlan.md](./BuildPlan.md) for the full
 architecture and milestone roadmap.
 
-> Status: **M3** — runnable gRPC vertical slice. The server starts and serves
-> `Collections.Create`, `Points.Upsert` (client-streaming), and `Query.Query`, with
-> health + reflection. HNSW, durability, versioning, payload/filter, and REST land
-> in later milestones.
-
-Run it:
+> Status: **M0–M14 complete.** A durable, versioned vector database server with
+> from-scratch HNSW (int8-quantized + SIMD), WAL crash-recovery, git-like
+> versioning (time-travel/branch/diff/restore), payload filtering, recommend,
+> compaction/GC, a gRPC **and** REST API, and a CLI.
 
 ```sh
-cargo run -p vecvec-server          # serves grpc://127.0.0.1:6334
+cargo run -p vecvec-server          # gRPC :6334 + REST :6333
 grpcurl -plaintext 127.0.0.1:6334 list
+curl localhost:6333/healthz
+cargo run -p vecvec-cli -- --help
 ```
+
+## Features
+
+- **HNSW** index from scratch (Alg-4 heuristic, deterministic builds, lock-free
+  sealed search) with **int8 scalar quantization + f32 rescore** (~4× memory, faster
+  search) and hand-written **NEON/AVX2 SIMD** distance kernels.
+- **Durable & crash-safe**: WAL-first writes (fsync before ack), generation-switched
+  checkpoints, recovery; segment store with mmap loading + CRC framing.
+- **Git-like versioning** (the differentiator): immutable manifest commits over
+  shared segments → snapshot-isolated **time-travel** query, branch, diff, restore;
+  rule-based auto-commit. Survives restart.
+- **Payload + filtered search** (Qdrant-style `must`/`should`/`must_not`),
+  **recommend-by-example**, **compaction + GC**, **export/import** (tar backup).
+- **Two transports**: gRPC (tonic) + REST/JSON (axum) over one shared core.
 
 ## Development
 
