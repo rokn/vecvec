@@ -3,11 +3,14 @@
 use std::sync::Arc;
 
 use vecvec_core::FsyncMode;
-use vecvec_server::{Service, serve};
+use vecvec_server::{Service, serve, serve_rest};
 
 #[tokio::main]
 async fn main() -> Result<(), vecvec_server::BoxError> {
-    let addr = std::env::var("VECVEC_GRPC_ADDR").unwrap_or_else(|_| "127.0.0.1:6334".to_string());
+    let grpc_addr =
+        std::env::var("VECVEC_GRPC_ADDR").unwrap_or_else(|_| "127.0.0.1:6334".to_string());
+    let rest_addr =
+        std::env::var("VECVEC_REST_ADDR").unwrap_or_else(|_| "127.0.0.1:6333".to_string());
     let data_dir = std::env::var("VECVEC_DATA_DIR").unwrap_or_else(|_| "vecvec-data".to_string());
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -15,12 +18,20 @@ async fn main() -> Result<(), vecvec_server::BoxError> {
 
     // Recover any existing collections before serving.
     let service = Arc::new(Service::open(&data_dir, cpus, cpus * 8, FsyncMode::Sync)?);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    let grpc_listener = tokio::net::TcpListener::bind(&grpc_addr).await?;
+    let rest_listener = tokio::net::TcpListener::bind(&rest_addr).await?;
     println!(
-        "vecvec-server {} listening on grpc://{} (data: {}) ",
+        "vecvec-server {} — grpc://{} · rest http://{} (data: {})",
         vecvec_core::VERSION,
-        listener.local_addr()?,
+        grpc_listener.local_addr()?,
+        rest_listener.local_addr()?,
         data_dir,
     );
-    serve(service, listener).await
+
+    let rest_service = service.clone();
+    let rest = tokio::spawn(async move { serve_rest(rest_service, rest_listener).await });
+    let grpc_result = serve(service, grpc_listener).await;
+    rest.abort();
+    grpc_result
 }

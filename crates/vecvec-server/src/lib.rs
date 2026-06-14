@@ -9,6 +9,7 @@
 pub mod blocking;
 pub mod grpc;
 pub mod registry;
+pub mod rest;
 pub mod service;
 
 pub use service::Service;
@@ -77,5 +78,12 @@ pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), B
 
     maintenance.abort();
     result?;
+    Ok(())
+}
+
+/// Serves the REST/JSON gateway on `listener` until shut down (the same `Service`
+/// the gRPC surface uses).
+pub async fn serve_rest(service: Arc<Service>, listener: TcpListener) -> Result<(), BoxError> {
+    axum::serve(listener, rest::router(service)).await?;
     Ok(())
 }
