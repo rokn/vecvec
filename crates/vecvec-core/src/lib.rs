@@ -27,6 +27,7 @@ pub mod ordered;
 pub mod payload;
 pub mod persist;
 pub mod quantization;
+pub mod query;
 pub mod segment;
 pub mod vector;
 pub mod version;

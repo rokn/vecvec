@@ -156,6 +156,33 @@ impl Service {
         Ok(results.into_iter().map(|s| (s.id.get(), s.score)).collect())
     }
 
+    /// Recommend-by-example over positive/negative point ids.
+    pub async fn recommend(
+        &self,
+        collection: String,
+        positive: Vec<u64>,
+        negative: Vec<u64>,
+        k: usize,
+        filter: Option<Filter>,
+    ) -> Result<Vec<(u64, f32)>, ServiceError> {
+        let durable = self.get(&collection)?;
+        let results = self
+            .bridge
+            .run(move || {
+                let pos: Vec<_> = positive
+                    .into_iter()
+                    .map(vecvec_core::GlobalId::new)
+                    .collect();
+                let neg: Vec<_> = negative
+                    .into_iter()
+                    .map(vecvec_core::GlobalId::new)
+                    .collect();
+                durable.recommend(&pos, &neg, k, filter.as_ref())
+            })
+            .await??;
+        Ok(results.into_iter().map(|s| (s.id.get(), s.score)).collect())
+    }
+
     fn get(&self, collection: &str) -> Result<StdArc<DurableCollection>, ServiceError> {
         self.registry
             .get(collection)

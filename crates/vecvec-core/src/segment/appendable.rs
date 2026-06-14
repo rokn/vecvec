@@ -74,6 +74,13 @@ impl AppendableSegment {
         self.ids.to_local(global).is_some()
     }
 
+    /// The f32 vector for `global`, if present (used by recommend-by-example).
+    pub(crate) fn vector_of(&self, global: GlobalId) -> Option<&[f32]> {
+        self.ids
+            .to_local(global)
+            .map(|local| self.vectors.get(local.to_point()))
+    }
+
     /// The inclusive global-id range this segment spans, or `None` if empty.
     pub fn global_id_range(&self) -> Option<(u64, u64)> {
         let ids = self.ids.global_ids();

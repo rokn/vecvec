@@ -70,6 +70,13 @@ impl SealedSegment {
         self.ids.to_local(global).is_some()
     }
 
+    /// The f32 vector for `global`, if present (used by recommend-by-example).
+    pub(crate) fn vector_of(&self, global: GlobalId) -> Option<&[f32]> {
+        self.ids
+            .to_local(global)
+            .map(|local| self.index.vectors().get(local.to_point()))
+    }
+
     /// Iterates `(global_id, vector)` for every row (used by compaction).
     pub(crate) fn iter_points(&self) -> impl Iterator<Item = (GlobalId, &[f32])> {
         let vectors = self.index.vectors();

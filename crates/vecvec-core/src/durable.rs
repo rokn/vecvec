@@ -296,6 +296,17 @@ impl DurableCollection {
         self.collection.search_at(selector, query, k, filter)
     }
 
+    /// Recommend-by-example: build a query from positive/negative example ids.
+    pub fn recommend(
+        &self,
+        positive: &[GlobalId],
+        negative: &[GlobalId],
+        k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<ScoredGlobal>> {
+        self.collection.recommend(positive, negative, k, filter)
+    }
+
     /// Diffs two versions.
     pub fn diff(&self, from: u64, to: u64) -> Result<crate::version::Diff> {
         self.collection.diff(from, to)

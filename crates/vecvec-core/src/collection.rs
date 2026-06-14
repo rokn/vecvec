@@ -378,6 +378,75 @@ impl Collection {
         self.commit("restore", Some(format!("restore of v{version}")), None)
     }
 
+    /// The live f32 vector for `global`, if present (appendable or working segments).
+    pub fn get_vector(&self, global: GlobalId) -> Option<Vec<f32>> {
+        if let Some(v) = self.appendable.read().vector_of(global) {
+            return Some(v.to_vec());
+        }
+        self.working
+            .load()
+            .iter()
+            .find_map(|s| s.vector_of(global).map(<[f32]>::to_vec))
+    }
+
+    /// Recommend-by-example: builds a query vector `mean(positives) - mean(negatives)`
+    /// from the example points' vectors and searches, excluding the positive
+    /// examples from the results. Requires at least one resolvable example.
+    pub fn recommend(
+        &self,
+        positive: &[GlobalId],
+        negative: &[GlobalId],
+        k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<ScoredGlobal>> {
+        let dim = self.config.dim;
+        let mut query = vec![0.0f32; dim];
+        let mut np = 0usize;
+        for &id in positive {
+            if let Some(v) = self.get_vector(id) {
+                for (q, x) in query.iter_mut().zip(&v) {
+                    *q += x;
+                }
+                np += 1;
+            }
+        }
+        let mut neg = vec![0.0f32; dim];
+        let mut nn = 0usize;
+        for &id in negative {
+            if let Some(v) = self.get_vector(id) {
+                for (q, x) in neg.iter_mut().zip(&v) {
+                    *q += x;
+                }
+                nn += 1;
+            }
+        }
+        if np + nn == 0 {
+            return Err(CoreError::Version {
+                detail: "recommend: no resolvable example points".into(),
+            });
+        }
+        if np > 0 {
+            for q in &mut query {
+                *q /= np as f32;
+            }
+        }
+        if nn > 0 {
+            for (q, n) in query.iter_mut().zip(&neg) {
+                *q -= n / nn as f32;
+            }
+        }
+        if self.config.metric.requires_normalization() {
+            crate::distance::l2_normalize(&mut query);
+        }
+
+        // Over-fetch so we can drop the positive examples, then trim to k.
+        let exclude: HashSet<u64> = positive.iter().map(|g| g.get()).collect();
+        let mut results = self.search(&query, k + exclude.len(), filter)?;
+        results.retain(|s| !exclude.contains(&s.id.get()));
+        results.truncate(k);
+        Ok(results)
+    }
+
     /// Merges all working sealed segments into one, cutting search fan-out. The old
     /// segments stay in the master registry (so versions referencing them remain
     /// queryable) until GC. Returns the merged segment id, or `None` if there was
@@ -657,6 +726,44 @@ mod tests {
         );
         // And we found a full page (bucket 3 has ~50 points, plenty for k=10).
         assert_eq!(got.len(), 10);
+    }
+
+    #[test]
+    fn recommend_by_example() {
+        let dim = 16;
+        let col = Collection::create(CollectionConfig::new("c", dim, Metric::Cosine));
+        // Two clusters: ids 0..20 around seed family A, 20..40 around B.
+        for i in 0..20 {
+            col.insert(&vec_of(dim, i + 1)).unwrap();
+        }
+        for i in 0..20 {
+            col.insert(&vec_of(dim, 10_000 + i)).unwrap();
+        }
+        // Recommend by a single example == search by that example's own vector,
+        // excluding the example itself.
+        let pos = [GlobalId::new(3)];
+        let got = col.recommend(&pos, &[], 5, None).unwrap();
+        assert_eq!(got.len(), 5);
+        assert!(got.iter().all(|s| s.id != GlobalId::new(3)));
+
+        let v3 = col.get_vector(GlobalId::new(3)).unwrap();
+        let direct: HashSet<u64> = col
+            .search(&v3, 6, None)
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.id != GlobalId::new(3))
+            .take(5)
+            .map(|s| s.id.get())
+            .collect();
+        let rec: HashSet<u64> = got.iter().map(|s| s.id.get()).collect();
+        // Equal as sets (re-normalization can flip near-ties in ordering).
+        assert_eq!(rec, direct);
+
+        // No resolvable examples -> error.
+        assert!(
+            col.recommend(&[GlobalId::new(99_999)], &[], 5, None)
+                .is_err()
+        );
     }
 
     #[test]

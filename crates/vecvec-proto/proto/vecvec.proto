@@ -81,8 +81,18 @@ message QueryResponse {
   repeated ScoredPoint results = 1;
 }
 
+message RecommendRequest {
+  string collection = 1;
+  repeated uint64 positive = 2;
+  repeated uint64 negative = 3;
+  uint32 k = 4;
+  optional string filter = 5;
+}
+
 service Query {
   rpc Query(QueryRequest) returns (QueryResponse);
+  // Recommend-by-example: query from positive/negative example point ids.
+  rpc Recommend(RecommendRequest) returns (QueryResponse);
 }
 
 // ---- Versioning (the differentiator) ----

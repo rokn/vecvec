@@ -141,6 +141,37 @@ impl pb::query_server::Query for Api {
                 .collect(),
         }))
     }
+
+    async fn recommend(
+        &self,
+        request: Request<pb::RecommendRequest>,
+    ) -> Result<Response<pb::QueryResponse>, Status> {
+        let req = request.into_inner();
+        let filter = match req.filter {
+            Some(json) => Some(
+                serde_json::from_str::<vecvec_core::Filter>(&json)
+                    .map_err(|e| Status::invalid_argument(format!("bad filter: {e}")))?,
+            ),
+            None => None,
+        };
+        let results = self
+            .svc
+            .recommend(
+                req.collection,
+                req.positive,
+                req.negative,
+                req.k as usize,
+                filter,
+            )
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(pb::QueryResponse {
+            results: results
+                .into_iter()
+                .map(|(id, score)| pb::ScoredPoint { id, score })
+                .collect(),
+        }))
+    }
 }
 
 #[tonic::async_trait]
