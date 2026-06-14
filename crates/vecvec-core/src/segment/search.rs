@@ -1,36 +1,37 @@
 //! Shared per-segment search helpers and the version-aware live filter.
 //!
-//! Deletions live at the collection level (a [`DeletionVector`] over global ids),
-//! not inside segments, so segment search takes the active deletion vector as an
-//! argument and filters by it via [`SegmentLiveFilter`], which maps each candidate's
-//! segment-local id to its global id. This is what gives snapshot isolation: a
-//! time-travel query passes a *frozen* deletion vector, unaffected by later deletes.
+//! Deletions (a [`DeletionVector`]) and payload filters (a [`FilterQuery`]) both
+//! live at the collection level and are passed into segment search, which adapts
+//! them to the index's [`FilterContext`] via [`SegmentLiveFilter`] by mapping each
+//! segment-local candidate to its global id. A time-travel query passes a *frozen*
+//! deletion vector, which is what gives snapshot isolation.
 
 use super::id_map::IdMap;
 use crate::distance::DistanceKernel;
 use crate::id::GlobalId;
 use crate::index::{CardinalityEstimate, FilterContext, scan_topk};
+use crate::payload::FilterQuery;
 use crate::vector::VectorStorage;
 use crate::version::DeletionVector;
 
-/// A [`FilterContext`] that admits a segment-local point iff it isn't tombstoned by
-/// the (collection-level) deletion vector and passes an optional payload filter.
+/// A [`FilterContext`] that admits a segment-local point iff it isn't tombstoned and
+/// passes the (optional) payload filter.
 pub(crate) struct SegmentLiveFilter<'a> {
     ids: &'a IdMap,
     deletions: &'a DeletionVector,
-    payload: Option<&'a dyn FilterContext>,
+    filter: Option<&'a FilterQuery<'a>>,
 }
 
 impl<'a> SegmentLiveFilter<'a> {
     pub(crate) fn new(
         ids: &'a IdMap,
         deletions: &'a DeletionVector,
-        payload: Option<&'a dyn FilterContext>,
+        filter: Option<&'a FilterQuery<'a>>,
     ) -> Self {
         Self {
             ids,
             deletions,
-            payload,
+            filter,
         }
     }
 }
@@ -41,7 +42,7 @@ impl FilterContext for SegmentLiveFilter<'_> {
         if self.deletions.contains(global) {
             return false;
         }
-        self.payload.is_none_or(|p| p.matches(local))
+        self.filter.is_none_or(|f| f.matches(global.get()))
     }
 
     fn estimate_cardinality(&self) -> CardinalityEstimate {
@@ -62,10 +63,10 @@ pub(crate) fn search_local(
     deletions: &DeletionVector,
     query: &[f32],
     k: usize,
-    payload: Option<&dyn FilterContext>,
+    filter: Option<&FilterQuery>,
 ) -> Vec<(GlobalId, f32)> {
-    let filter = SegmentLiveFilter::new(ids, deletions, payload);
-    scan_topk(vectors, kernel, query, k, None, Some(&filter))
+    let live = SegmentLiveFilter::new(ids, deletions, filter);
+    scan_topk(vectors, kernel, query, k, None, Some(&live))
         .into_iter()
         .map(|sp| (ids.global_at(sp.id.to_local()), sp.score))
         .collect()

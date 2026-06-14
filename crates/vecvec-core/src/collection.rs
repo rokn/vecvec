@@ -23,7 +23,8 @@ use parking_lot::{Mutex, RwLock};
 use crate::distance::Metric;
 use crate::error::{CoreError, Result};
 use crate::id::{GlobalId, SegmentId};
-use crate::index::{BoundedTopK, FilterContext, HnswConfig};
+use crate::index::{BoundedTopK, HnswConfig};
+use crate::payload::{Filter, FilterQuery, Payload, PayloadMap};
 use crate::segment::{AppendableSegment, SealedSegment, SegmentSet};
 use crate::version::policy::Clock;
 use crate::version::{
@@ -79,6 +80,8 @@ pub struct Collection {
     all_segments: RwLock<BTreeMap<SegmentId, Arc<SealedSegment>>>,
     /// The live tombstones.
     working_deletions: ArcSwap<DeletionVector>,
+    /// Per-point payloads, keyed by global id (collection-level, like deletions).
+    payloads: RwLock<PayloadMap>,
     versions: Mutex<VersionStore>,
     next_global_id: AtomicU64,
     next_segment_id: AtomicU64,
@@ -94,6 +97,7 @@ impl Collection {
             working: ArcSwap::from_pointee(SegmentSet::empty()),
             all_segments: RwLock::new(BTreeMap::new()),
             working_deletions: ArcSwap::from_pointee(DeletionVector::new()),
+            payloads: RwLock::new(PayloadMap::new()),
             versions: Mutex::new(VersionStore::new()),
             next_global_id: AtomicU64::new(0),
             next_segment_id: AtomicU64::new(0),
@@ -130,11 +134,34 @@ impl Collection {
     /// Appends a vector under a specific global id, advancing the allocator past it.
     /// The single in-memory upsert apply path (live writes and WAL recovery).
     pub fn insert_with_id(&self, id: GlobalId, vector: &[f32]) -> Result<()> {
+        self.insert_with_id_and_payload(id, vector, None)
+    }
+
+    /// Like [`Collection::insert_with_id`] but also stores a payload.
+    pub fn insert_with_id_and_payload(
+        &self,
+        id: GlobalId,
+        vector: &[f32],
+        payload: Option<Payload>,
+    ) -> Result<()> {
         self.check_dim(vector)?;
         self.appendable.write().append(id, vector);
         self.next_global_id
             .fetch_max(id.get() + 1, Ordering::Relaxed);
+        if let Some(p) = payload {
+            self.payloads.write().insert(id.get(), p);
+        }
         Ok(())
+    }
+
+    /// A snapshot copy of the payload map (for checkpoint persistence).
+    pub fn payloads_snapshot(&self) -> PayloadMap {
+        self.payloads.read().clone()
+    }
+
+    /// Replaces the payload map (recovery).
+    pub(crate) fn set_payloads(&self, payloads: PayloadMap) {
+        *self.payloads.write() = payloads;
     }
 
     fn check_dim(&self, vector: &[f32]) -> Result<()> {
@@ -209,21 +236,26 @@ impl Collection {
         &self,
         query: &[f32],
         k: usize,
-        filter: Option<&dyn FilterContext>,
+        filter: Option<&Filter>,
     ) -> Result<Vec<ScoredGlobal>> {
         self.check_dim(query)?;
         let higher = self.config.metric.higher_is_better();
         let deletions = self.working_deletions.load_full();
         let working = self.working.load_full();
+        let payloads = self.payloads.read();
+        let fq = filter.map(|f| FilterQuery {
+            filter: f,
+            payloads: &payloads,
+        });
         let mut merger = BoundedTopK::<GlobalId>::new(k, higher);
         for seg in working.iter() {
-            for (id, score) in seg.search(query, k, &deletions, filter) {
+            for (id, score) in seg.search(query, k, &deletions, fq.as_ref()) {
                 merger.offer(id, score);
             }
         }
         {
             let app = self.appendable.read();
-            for (id, score) in app.search(query, k, &deletions, filter) {
+            for (id, score) in app.search(query, k, &deletions, fq.as_ref()) {
                 merger.offer(id, score);
             }
         }
@@ -237,7 +269,7 @@ impl Collection {
         selector: &VersionSelector,
         query: &[f32],
         k: usize,
-        filter: Option<&dyn FilterContext>,
+        filter: Option<&Filter>,
     ) -> Result<Vec<ScoredGlobal>> {
         self.check_dim(query)?;
         let (segment_ids, deletions) = {
@@ -255,10 +287,15 @@ impl Collection {
         };
         let higher = self.config.metric.higher_is_better();
         let all = self.all_segments.read();
+        let payloads = self.payloads.read();
+        let fq = filter.map(|f| FilterQuery {
+            filter: f,
+            payloads: &payloads,
+        });
         let mut merger = BoundedTopK::<GlobalId>::new(k, higher);
         for sid in segment_ids {
             if let Some(seg) = all.get(&SegmentId::new(sid)) {
-                for (id, score) in seg.search(query, k, &deletions, filter) {
+                for (id, score) in seg.search(query, k, &deletions, fq.as_ref()) {
                     merger.offer(id, score);
                 }
             }
@@ -529,6 +566,49 @@ mod tests {
             .search_at(&VersionSelector::Version(v1), &vec_of(dim, 1), 40, None)
             .unwrap();
         assert_eq!(at_v1.len(), 30);
+    }
+
+    #[test]
+    fn filtered_search_matches_reference() {
+        use crate::payload::{Condition, Filter};
+        let dim = 16;
+        let n = 400;
+        let col = Collection::create(config(dim));
+        // Insert with a "bucket" payload field (10 buckets) and seal half.
+        for i in 0..n {
+            let id = col.insert(&vec_of(dim, i + 1)).unwrap();
+            col.payloads
+                .write()
+                .insert(id.get(), serde_json::json!({ "bucket": i % 10 }));
+        }
+        col.seal(); // half-ish into a sealed HNSW segment, rest appendable
+        for i in n..(n + 100) {
+            let id = col.insert(&vec_of(dim, i + 1)).unwrap();
+            col.payloads
+                .write()
+                .insert(id.get(), serde_json::json!({ "bucket": i % 10 }));
+        }
+
+        // Filter to a single, highly-selective bucket (~10% of points): exercises the
+        // exact-scan fallback in sealed segments.
+        let filter = Filter {
+            must: vec![Condition {
+                key: "bucket".into(),
+                r#match: Some(serde_json::json!(3)),
+                range: None,
+            }],
+            ..Default::default()
+        };
+        let query = vec_of(dim, 99_999);
+        let got = col.search(&query, 10, Some(&filter)).unwrap();
+        // Every result is in bucket 3.
+        let payloads = col.payloads.read();
+        assert!(
+            got.iter()
+                .all(|s| payloads.get(&s.id.get()) == Some(&serde_json::json!({ "bucket": 3 })))
+        );
+        // And we found a full page (bucket 3 has ~50 points, plenty for k=10).
+        assert_eq!(got.len(), 10);
     }
 
     #[test]

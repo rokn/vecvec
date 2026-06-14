@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::collection::{Collection, CollectionConfig, ScoredGlobal};
 use crate::error::{CoreError, Result};
 use crate::id::{GlobalId, SegmentId};
-use crate::index::FilterContext;
+use crate::payload::{Filter, Payload, PayloadMap};
 use crate::persist::atomic::{FileKind, read_framed, write_atomic};
 use crate::persist::wal::{Wal, WalOp};
 use crate::segment::SegmentStore;
@@ -81,6 +81,8 @@ struct CheckpointHead {
     next_segment_id: u64,
     #[serde(default)]
     deletions: crate::version::DeletionVector,
+    #[serde(default)]
+    payloads: PayloadMap,
 }
 
 struct WalState {
@@ -149,6 +151,7 @@ impl DurableCollection {
             collection.install_recovered(segments, &head.working_segment_ids);
             collection.set_allocators(head.next_global_id, head.next_segment_id);
             collection.set_deletions(head.deletions);
+            collection.set_payloads(head.payloads);
             head.wal_generation
         } else {
             // No checkpoint, but versions may still reference persisted segments.
@@ -223,11 +226,11 @@ impl DurableCollection {
         self.collection.is_empty()
     }
 
-    /// Durably appends a batch of vectors, returning their assigned ids. WAL-first:
-    /// logged + fsynced before applied in memory.
-    pub fn upsert(&self, vectors: Vec<Vec<f32>>) -> Result<Vec<u64>> {
+    /// Durably appends a batch of `(vector, payload)` points, returning their ids.
+    /// WAL-first: logged + fsynced before applied in memory.
+    pub fn upsert(&self, points: Vec<(Vec<f32>, Option<Payload>)>) -> Result<Vec<u64>> {
         let dim = self.collection.config().dim;
-        for v in &vectors {
+        for (v, _) in &points {
             if v.len() != dim {
                 return Err(CoreError::DimensionMismatch {
                     expected: dim,
@@ -237,12 +240,13 @@ impl DurableCollection {
         }
 
         let mut guard = self.wal.lock();
-        let mut ids = Vec::with_capacity(vectors.len());
-        for v in &vectors {
+        let mut ids = Vec::with_capacity(points.len());
+        for (v, payload) in &points {
             let id = self.collection.alloc_global_id();
             guard.wal.append(&WalOp::Upsert {
                 id: id.get(),
                 vector: v.clone(),
+                payload: payload.clone(),
             })?;
             ids.push(id.get());
         }
@@ -250,8 +254,9 @@ impl DurableCollection {
             guard.wal.flush()?;
         }
         // Durable -> apply in memory (the same path recovery uses).
-        for (id, v) in ids.iter().zip(&vectors) {
-            self.collection.insert_with_id(GlobalId::new(*id), v)?;
+        for (id, (v, payload)) in ids.iter().zip(points) {
+            self.collection
+                .insert_with_id_and_payload(GlobalId::new(*id), &v, payload)?;
         }
         drop(guard);
 
@@ -286,7 +291,7 @@ impl DurableCollection {
         selector: &crate::version::VersionSelector,
         query: &[f32],
         k: usize,
-        filter: Option<&dyn FilterContext>,
+        filter: Option<&Filter>,
     ) -> Result<Vec<ScoredGlobal>> {
         self.collection.search_at(selector, query, k, filter)
     }
@@ -335,7 +340,7 @@ impl DurableCollection {
         &self,
         query: &[f32],
         k: usize,
-        filter: Option<&dyn FilterContext>,
+        filter: Option<&Filter>,
     ) -> Result<Vec<ScoredGlobal>> {
         self.collection.search(query, k, filter)
     }
@@ -371,6 +376,7 @@ impl DurableCollection {
             next_global_id: self.collection.next_global_id_value(),
             next_segment_id: self.collection.next_segment_id_value(),
             deletions: DeletionVector::clone(&self.collection.deletions_snapshot()),
+            payloads: self.collection.payloads_snapshot(),
         };
         let head_bytes = rmp_serde::to_vec(&head).map_err(|e| CoreError::Serialization {
             detail: e.to_string(),
@@ -395,10 +401,15 @@ impl DurableCollection {
 /// live writes and recovery.
 fn apply_op(collection: &Collection, op: &WalOp) {
     match op {
-        WalOp::Upsert { id, vector } => {
+        WalOp::Upsert {
+            id,
+            vector,
+            payload,
+        } => {
             // Recovery trusts the WAL; a dimension mismatch here would mean a
             // corrupt record that passed CRC, which we treat as non-fatal-skip.
-            let _ = collection.insert_with_id(GlobalId::new(*id), vector);
+            let _ =
+                collection.insert_with_id_and_payload(GlobalId::new(*id), vector, payload.clone());
         }
         WalOp::Delete { id } => {
             collection.delete(GlobalId::new(*id));
@@ -425,7 +436,9 @@ mod tests {
         let first_id;
         {
             let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
-            let ids = dc.upsert((0..20).map(|i| vecf(8, i)).collect()).unwrap();
+            let ids = dc
+                .upsert((0..20).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
             first_id = ids[3];
             assert_eq!(dc.len(), 20);
             // crash: drop without checkpoint
@@ -446,7 +459,8 @@ mod tests {
         let v1;
         {
             let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
-            dc.upsert((0..30).map(|i| vecf(8, i)).collect()).unwrap();
+            dc.upsert((0..30).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
             v1 = dc.commit(Some("first".into()), None).unwrap();
             // delete some after the commit, then add more
             dc.delete(2).unwrap();
@@ -471,10 +485,12 @@ mod tests {
         let cfg = CollectionConfig::new("c", 8, Metric::Cosine);
         {
             let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
-            dc.upsert((0..30).map(|i| vecf(8, i)).collect()).unwrap();
+            dc.upsert((0..30).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
             dc.checkpoint().unwrap();
             // more writes after the checkpoint
-            dc.upsert((30..40).map(|i| vecf(8, i)).collect()).unwrap();
+            dc.upsert((30..40).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
             assert_eq!(dc.len(), 40);
         }
         let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
@@ -497,13 +513,13 @@ mod tests {
             {
                 let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
                 for i in 0..n1 {
-                    all_ids.push(dc.upsert(vec![vecf(8, i)]).unwrap()[0]);
+                    all_ids.push(dc.upsert(vec![(vecf(8, i), None)]).unwrap()[0]);
                 }
                 if do_ckpt {
                     dc.checkpoint().unwrap();
                 }
                 for i in 0..n2 {
-                    all_ids.push(dc.upsert(vec![vecf(8, n1 + i)]).unwrap()[0]);
+                    all_ids.push(dc.upsert(vec![(vecf(8, n1 + i), None)]).unwrap()[0]);
                 }
                 let ndel = ndel.min(all_ids.len());
                 for &id in &all_ids[..ndel] {

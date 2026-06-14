@@ -30,6 +30,8 @@ service Collections {
 
 message Vector {
   repeated float values = 1;
+  // Optional JSON object payload attached to the point.
+  optional string payload = 2;
 }
 
 // One streamed batch of vectors to append to a collection. At M3 ids are
@@ -66,6 +68,8 @@ message QueryRequest {
   uint32 k = 3;
   // Time-travel: read as of this version/tag/branch. Absent = live.
   optional VersionRef at = 4;
+  // Optional JSON filter (must/should/must_not over field conditions).
+  optional string filter = 5;
 }
 
 message ScoredPoint {

@@ -84,20 +84,27 @@ impl pb::points_server::Points for Api {
     ) -> Result<Response<pb::UpsertResponse>, Status> {
         let mut stream = request.into_inner();
         let mut collection: Option<String> = None;
-        let mut vectors: Vec<Vec<f32>> = Vec::new();
+        let mut points: Vec<(Vec<f32>, Option<vecvec_core::Payload>)> = Vec::new();
         while let Some(batch) = stream.message().await? {
             if collection.is_none() && !batch.collection.is_empty() {
                 collection = Some(batch.collection);
             }
             for v in batch.vectors {
-                vectors.push(v.values);
+                let payload = match v.payload {
+                    Some(json) => Some(
+                        serde_json::from_str(&json)
+                            .map_err(|e| Status::invalid_argument(format!("bad payload: {e}")))?,
+                    ),
+                    None => None,
+                };
+                points.push((v.values, payload));
             }
         }
         let collection =
             collection.ok_or_else(|| Status::invalid_argument("no collection specified"))?;
         let ids = self
             .svc
-            .upsert(collection, vectors)
+            .upsert(collection, points)
             .await
             .map_err(to_status)?;
         Ok(Response::new(pb::UpsertResponse {
@@ -115,9 +122,16 @@ impl pb::query_server::Query for Api {
     ) -> Result<Response<pb::QueryResponse>, Status> {
         let req = request.into_inner();
         let at = version_selector(req.at);
+        let filter = match req.filter {
+            Some(json) => Some(
+                serde_json::from_str::<vecvec_core::Filter>(&json)
+                    .map_err(|e| Status::invalid_argument(format!("bad filter: {e}")))?,
+            ),
+            None => None,
+        };
         let results = self
             .svc
-            .query(req.collection, req.vector, req.k as usize, at)
+            .query(req.collection, req.vector, req.k as usize, at, filter)
             .await
             .map_err(to_status)?;
         Ok(Response::new(pb::QueryResponse {

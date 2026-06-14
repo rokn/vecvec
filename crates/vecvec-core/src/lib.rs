@@ -24,6 +24,7 @@ pub mod error;
 pub mod id;
 pub mod index;
 pub mod ordered;
+pub mod payload;
 pub mod persist;
 pub mod quantization;
 pub mod segment;
@@ -40,6 +41,7 @@ pub use index::{
     SoftDeleteSet, brute_force_topk,
 };
 pub use ordered::{OrderedF32, OrderedF64};
+pub use payload::{Filter, Payload};
 pub use segment::{AppendableSegment, SealedSegment, SegmentSet};
 pub use vector::VectorStorage;
 

@@ -101,6 +101,7 @@ async fn create_upsert_query_over_grpc() {
                 .iter()
                 .map(|&i| pb::Vector {
                     values: vec_of(dim, i as u32 + 1),
+                    payload: None,
                 })
                 .collect(),
         })
@@ -123,6 +124,7 @@ async fn create_upsert_query_over_grpc() {
             vector: q.clone(),
             k: 10,
             at: None,
+            filter: None,
         })
         .await
         .unwrap()
@@ -177,6 +179,7 @@ async fn errors_map_to_grpc_status_codes() {
             vector: vec![0.0; 4],
             k: 5,
             at: None,
+            filter: None,
         })
         .await
         .unwrap_err();
@@ -189,10 +192,66 @@ async fn errors_map_to_grpc_status_codes() {
             vector: vec![0.0; 3],
             k: 5,
             at: None,
+            filter: None,
         })
         .await
         .unwrap_err();
     assert_eq!(bad_dim.code(), tonic::Code::InvalidArgument);
+
+    server.abort();
+}
+
+/// M9: payload + filtered query over gRPC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_query_over_grpc() {
+    let data = tempfile::tempdir().unwrap();
+    let dim = 8usize;
+    let service = Arc::new(Service::open(data.path(), 2, 8, FsyncMode::Sync).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { serve(service, listener).await });
+    let channel = connect(addr).await;
+
+    pb::collections_client::CollectionsClient::new(channel.clone())
+        .create(pb::CreateCollectionRequest {
+            name: "f".into(),
+            dim: dim as u32,
+            metric: pb::Metric::Dot as i32,
+        })
+        .await
+        .unwrap();
+
+    // 100 points, each tagged with bucket = id % 5.
+    let batch = pb::UpsertRequest {
+        collection: "f".into(),
+        vectors: (0..100u32)
+            .map(|i| pb::Vector {
+                values: vec_of(dim, i + 1),
+                payload: Some(format!("{{\"bucket\":{}}}", i % 5)),
+            })
+            .collect(),
+    };
+    pb::points_client::PointsClient::new(channel.clone())
+        .upsert(tokio_stream::iter(vec![batch]))
+        .await
+        .unwrap();
+
+    // Query filtered to bucket == 2.
+    let resp = pb::query_client::QueryClient::new(channel)
+        .query(pb::QueryRequest {
+            collection: "f".into(),
+            vector: vec_of(dim, 9_999),
+            k: 10,
+            at: None,
+            filter: Some(r#"{"must":[{"key":"bucket","match":2}]}"#.into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(resp.results.len(), 10);
+    // Server-assigned ids are insertion order, so id % 5 == 2 <=> bucket 2.
+    assert!(resp.results.iter().all(|r| r.id % 5 == 2));
 
     server.abort();
 }
@@ -227,6 +286,7 @@ async fn versioning_over_grpc() {
         vectors: (from..from + n)
             .map(|i| pb::Vector {
                 values: vec_of(dim, i as u32 + 1),
+                payload: None,
             })
             .collect(),
     };
@@ -289,6 +349,7 @@ async fn versioning_over_grpc() {
                     vector: q,
                     k: 50,
                     at: at_ref,
+                    filter: None,
                 })
                 .await
                 .unwrap()
@@ -332,6 +393,7 @@ async fn versioning_over_grpc() {
             at: Some(pb::VersionRef {
                 selector: Some(pb::version_ref::Selector::Tag("base".into())),
             }),
+            filter: None,
         })
         .await
         .unwrap()
@@ -380,6 +442,7 @@ async fn data_survives_server_restart() {
             vectors: (0..n)
                 .map(|i| pb::Vector {
                     values: vec_of(dim, i as u32 + 1),
+                    payload: None,
                 })
                 .collect(),
         };
@@ -406,6 +469,7 @@ async fn data_survives_server_restart() {
                 vector: vec_of(dim, 7),
                 k: n as u32,
                 at: None,
+                filter: None,
             })
             .await
             .unwrap()

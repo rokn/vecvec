@@ -14,7 +14,8 @@ use super::search::search_local;
 use crate::distance::{DistanceKernel, Metric};
 use crate::id::SegmentId;
 use crate::id::{GlobalId, LocalId};
-use crate::index::{FilterContext, HnswConfig, HnswIndex};
+use crate::index::{HnswConfig, HnswIndex};
+use crate::payload::FilterQuery;
 use crate::vector::VectorStorage;
 use crate::version::DeletionVector;
 
@@ -82,13 +83,14 @@ impl AppendableSegment {
         }
     }
 
-    /// Exact top-k search excluding `deletions`, returning `(global_id, score)`.
+    /// Exact top-k search excluding `deletions` and applying the optional `filter`,
+    /// returning `(global_id, score)`.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         deletions: &DeletionVector,
-        payload: Option<&dyn FilterContext>,
+        filter: Option<&FilterQuery>,
     ) -> Vec<(GlobalId, f32)> {
         search_local(
             &self.vectors,
@@ -97,7 +99,7 @@ impl AppendableSegment {
             deletions,
             query,
             k,
-            payload,
+            filter,
         )
     }
 

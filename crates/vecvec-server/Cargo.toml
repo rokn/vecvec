@@ -26,6 +26,7 @@ tokio-stream = { workspace = true, features = ["net"] }
 dashmap.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 vecvec-core.workspace = true

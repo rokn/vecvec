@@ -21,12 +21,15 @@ use crate::error::{CoreError, Result};
 /// A logged mutation. The single source of truth for both live apply and recovery.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalOp {
-    /// Insert a vector under a specific (already-allocated) global id.
+    /// Insert a vector (and optional payload) under a specific global id.
     Upsert {
         /// The collection-global id assigned to this point.
         id: u64,
         /// The vector (in stored form).
         vector: Vec<f32>,
+        /// Optional JSON payload.
+        #[serde(default)]
+        payload: Option<crate::payload::Payload>,
     },
     /// Tombstone a point by global id.
     Delete {
@@ -165,6 +168,7 @@ mod tests {
             wal.append(&WalOp::Upsert {
                 id: 1,
                 vector: vec![1.0, 2.0],
+                payload: None,
             })
             .unwrap();
             wal.append(&WalOp::Delete { id: 1 }).unwrap();
@@ -188,6 +192,7 @@ mod tests {
                 wal.append(&WalOp::Upsert {
                     id: i,
                     vector: vec![i as f32],
+                    payload: None,
                 })
                 .unwrap();
             }

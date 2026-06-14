@@ -13,7 +13,7 @@ use std::sync::Arc as StdArc;
 
 use vecvec_core::durable::read_config;
 use vecvec_core::version::{Manifest, VersionSelector};
-use vecvec_core::{CollectionConfig, DurableCollection, FsyncMode, Metric};
+use vecvec_core::{CollectionConfig, DurableCollection, Filter, FsyncMode, Metric, Payload};
 
 use crate::blocking::{BlockingBridge, BridgeError};
 use crate::registry::Registry;
@@ -118,28 +118,29 @@ impl Service {
         Ok(())
     }
 
-    /// Durably appends a batch of vectors to a collection, returning their ids.
+    /// Durably appends a batch of `(vector, payload)` points, returning their ids.
     pub async fn upsert(
         &self,
         collection: String,
-        vectors: Vec<Vec<f32>>,
+        points: Vec<(Vec<f32>, Option<Payload>)>,
     ) -> Result<Vec<u64>, ServiceError> {
         let durable = self
             .registry
             .get(&collection)
             .ok_or(ServiceError::NotFound(collection))?;
-        let ids = self.bridge.run(move || durable.upsert(vectors)).await??;
+        let ids = self.bridge.run(move || durable.upsert(points)).await??;
         Ok(ids)
     }
 
     /// Returns the best `k` matches for `query`, optionally as of a past version
-    /// (`at`) for a time-travel query.
+    /// (`at`) and/or constrained by a payload `filter`.
     pub async fn query(
         &self,
         collection: String,
         query: Vec<f32>,
         k: usize,
         at: Option<VersionSelector>,
+        filter: Option<Filter>,
     ) -> Result<Vec<(u64, f32)>, ServiceError> {
         let durable = self
             .registry
@@ -148,8 +149,8 @@ impl Service {
         let results = self
             .bridge
             .run(move || match at {
-                Some(selector) => durable.search_at(&selector, &query, k, None),
-                None => durable.search(&query, k, None),
+                Some(selector) => durable.search_at(&selector, &query, k, filter.as_ref()),
+                None => durable.search(&query, k, filter.as_ref()),
             })
             .await??;
         Ok(results.into_iter().map(|s| (s.id.get(), s.score)).collect())

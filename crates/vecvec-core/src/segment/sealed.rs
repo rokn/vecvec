@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use super::id_map::IdMap;
 use super::search::SegmentLiveFilter;
-use crate::distance::Metric;
+use crate::distance::{DistanceKernel, Metric};
 use crate::id::{GlobalId, SegmentId};
-use crate::index::{FilterContext, HnswIndex, Index, SearchParams};
+use crate::index::{HnswIndex, Index, SearchParams, scan_topk};
+use crate::payload::FilterQuery;
 use crate::version::DeletionVector;
 
 /// An immutable, HNSW-backed segment.
@@ -78,17 +79,31 @@ impl SealedSegment {
         }
     }
 
-    /// HNSW top-k search excluding `deletions`, returning `(global_id, score)`.
+    /// HNSW top-k search excluding `deletions` and applying the (optional) payload
+    /// `filter`, returning `(global_id, score)`.
+    ///
+    /// A selective filter can starve the HNSW beam (too few matches reachable), so
+    /// if the filtered graph search under-fills we fall back to an exact filtered
+    /// scan over the segment's f32 vectors — correct at the cost of an O(n) pass,
+    /// taken only when the filter is highly selective.
     pub fn search(
         &self,
         query: &[f32],
         k: usize,
         deletions: &DeletionVector,
-        payload: Option<&dyn FilterContext>,
+        filter: Option<&FilterQuery>,
     ) -> Vec<(GlobalId, f32)> {
-        let filter = SegmentLiveFilter::new(&self.ids, deletions, payload);
-        self.index
-            .search(query, k, SearchParams::default(), Some(&filter))
+        let live = SegmentLiveFilter::new(&self.ids, deletions, filter);
+        let graph_results = self
+            .index
+            .search(query, k, SearchParams::default(), Some(&live));
+        let results = if filter.is_some() && graph_results.len() < k {
+            let kernel = DistanceKernel::new(self.metric(), self.index.vectors().dim());
+            scan_topk(self.index.vectors(), &kernel, query, k, None, Some(&live))
+        } else {
+            graph_results
+        };
+        results
             .into_iter()
             .map(|sp| (self.ids.global_at(sp.id.to_local()), sp.score))
             .collect()
