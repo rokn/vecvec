@@ -32,6 +32,32 @@ use crate::version::{
     VersionStore, VersioningPolicy,
 };
 
+/// Rules for automatic compaction (merging the working segments into one, with a
+/// freshly-built HNSW graph). Triggers are OR-ed: when the working set reaches
+/// `max_segments` sealed segments, and/or every `interval_ms`. All `None` = manual
+/// compaction only. Evaluated by a background maintenance loop, never on the write
+/// path, since compaction rebuilds a graph and is comparatively expensive.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct CompactionPolicy {
+    /// Compact once the working set holds at least this many sealed segments.
+    pub max_segments: Option<usize>,
+    /// Compact once this many milliseconds have elapsed since the last compaction
+    /// (only when there is more than one working segment to merge).
+    pub interval_ms: Option<u64>,
+}
+
+impl CompactionPolicy {
+    /// A policy that compacts only on explicit request.
+    pub fn manual() -> Self {
+        Self::default()
+    }
+
+    /// Whether any automatic trigger is configured.
+    pub fn is_automatic(&self) -> bool {
+        self.max_segments.is_some() || self.interval_ms.is_some()
+    }
+}
+
 /// Static configuration of a collection.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CollectionConfig {
@@ -46,10 +72,14 @@ pub struct CollectionConfig {
     /// Automatic-commit policy.
     #[serde(default)]
     pub versioning: VersioningPolicy,
+    /// Automatic-compaction policy.
+    #[serde(default)]
+    pub compaction: CompactionPolicy,
 }
 
 impl CollectionConfig {
-    /// Convenience constructor with default HNSW + manual versioning.
+    /// Convenience constructor with default HNSW + manual versioning + manual
+    /// compaction.
     pub fn new(name: impl Into<String>, dim: usize, metric: Metric) -> Self {
         Self {
             name: name.into(),
@@ -57,6 +87,7 @@ impl CollectionConfig {
             metric,
             hnsw: HnswConfig::default(),
             versioning: VersioningPolicy::default(),
+            compaction: CompactionPolicy::default(),
         }
     }
 }
@@ -738,6 +769,7 @@ mod tests {
             metric: Metric::Dot,
             hnsw: HnswConfig::default(),
             versioning: VersioningPolicy::manual(),
+            compaction: CompactionPolicy::manual(),
         }
     }
 

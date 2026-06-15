@@ -13,7 +13,9 @@ use std::sync::Arc as StdArc;
 
 use vecvec_core::durable::read_config;
 use vecvec_core::version::{Manifest, VersionSelector};
-use vecvec_core::{CollectionConfig, DurableCollection, Filter, FsyncMode, Metric, Payload};
+use vecvec_core::{
+    CollectionConfig, CompactionPolicy, DurableCollection, Filter, FsyncMode, Metric, Payload,
+};
 
 use crate::blocking::{BlockingBridge, BridgeError};
 use crate::registry::Registry;
@@ -56,23 +58,46 @@ pub struct Service {
     bridge: BlockingBridge,
     data_dir: PathBuf,
     fsync: FsyncMode,
+    /// Auto-compaction policy applied to every collection this service opens.
+    compaction: CompactionPolicy,
 }
 
 impl Service {
     /// Opens a service rooted at `data_dir`, recovering all existing collections
     /// before returning. Uses a `cpu_threads`-wide compute pool allowing
-    /// `max_inflight` concurrent CPU jobs.
+    /// `max_inflight` concurrent CPU jobs. Auto-compaction is disabled (manual
+    /// only); use [`open_with_compaction`](Self::open_with_compaction) to enable it.
     pub fn open(
         data_dir: impl Into<PathBuf>,
         cpu_threads: usize,
         max_inflight: usize,
         fsync: FsyncMode,
     ) -> Result<Self, ServiceError> {
+        Self::open_with_compaction(
+            data_dir,
+            cpu_threads,
+            max_inflight,
+            fsync,
+            CompactionPolicy::default(),
+        )
+    }
+
+    /// Like [`open`](Self::open), but applies `compaction` to every collection it
+    /// opens or creates. The server's background maintenance loop polls each
+    /// collection's trigger and compacts off the write path.
+    pub fn open_with_compaction(
+        data_dir: impl Into<PathBuf>,
+        cpu_threads: usize,
+        max_inflight: usize,
+        fsync: FsyncMode,
+        compaction: CompactionPolicy,
+    ) -> Result<Self, ServiceError> {
         let service = Self {
             registry: Registry::new(),
             bridge: BlockingBridge::new(cpu_threads, max_inflight),
             data_dir: data_dir.into(),
             fsync,
+            compaction,
         };
         service.recover_all()?;
         Ok(service)
@@ -98,7 +123,8 @@ impl Service {
             let path = entry.path();
             if path.is_dir() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                let config = read_config(&path)?;
+                let mut config = read_config(&path)?;
+                config.compaction = self.compaction;
                 let collection = DurableCollection::open(&path, config, self.fsync)?;
                 self.registry.insert_new(name, Arc::new(collection));
             }
@@ -125,7 +151,8 @@ impl Service {
             return Err(ServiceError::AlreadyExists(name));
         }
         let dir = self.collections_dir().join(&name);
-        let config = CollectionConfig::new(name.clone(), dim, metric);
+        let mut config = CollectionConfig::new(name.clone(), dim, metric);
+        config.compaction = self.compaction;
         let collection = Arc::new(DurableCollection::open(&dir, config, self.fsync)?);
         if !self.registry.insert_new(name.clone(), collection) {
             return Err(ServiceError::AlreadyExists(name));
@@ -145,6 +172,24 @@ impl Service {
             .ok_or(ServiceError::NotFound(collection))?;
         let ids = self.bridge.run(move || durable.upsert(points)).await??;
         Ok(ids)
+    }
+
+    /// Atomically applies a mixed delete + upsert batch, optionally committing a
+    /// new version afterwards (a transaction-like unit of work). Returns the
+    /// upserted ids, how many points were newly deleted, and the version if one
+    /// was created. `commit` is `Some((message, tag))` to commit after the batch.
+    pub async fn write_batch(
+        &self,
+        collection: String,
+        upserts: Vec<(Vec<f32>, Option<Payload>)>,
+        deletes: Vec<u64>,
+        commit: Option<(Option<String>, Option<String>)>,
+    ) -> Result<vecvec_core::WriteBatchResult, ServiceError> {
+        let durable = self.get(&collection)?;
+        Ok(self
+            .bridge
+            .run(move || durable.write_batch(upserts, deletes, commit))
+            .await??)
     }
 
     /// Returns the best `k` matches for `query`, optionally as of a past version

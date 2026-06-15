@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use vecvec_core::FsyncMode;
-use vecvec_server::{Service, serve, serve_rest};
+use vecvec_server::{Service, compaction_policy_from_env, serve, serve_rest};
 
 #[tokio::main]
 async fn main() -> Result<(), vecvec_server::BoxError> {
@@ -17,7 +17,14 @@ async fn main() -> Result<(), vecvec_server::BoxError> {
         .unwrap_or(4);
 
     // Recover any existing collections before serving.
-    let service = Arc::new(Service::open(&data_dir, cpus, cpus * 8, FsyncMode::Sync)?);
+    let compaction = compaction_policy_from_env();
+    let service = Arc::new(Service::open_with_compaction(
+        &data_dir,
+        cpus,
+        cpus * 8,
+        FsyncMode::Sync,
+        compaction,
+    )?);
 
     let grpc_listener = tokio::net::TcpListener::bind(&grpc_addr).await?;
     let rest_listener = tokio::net::TcpListener::bind(&rest_addr).await?;
@@ -27,6 +34,11 @@ async fn main() -> Result<(), vecvec_server::BoxError> {
         grpc_listener.local_addr()?,
         rest_listener.local_addr()?,
         data_dir,
+    );
+    println!(
+        "auto-compaction: max_segments={:?}, interval_secs={:?}",
+        compaction.max_segments,
+        compaction.interval_ms.map(|ms| ms / 1000),
     );
 
     let rest_service = service.clone();

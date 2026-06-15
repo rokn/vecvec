@@ -112,6 +112,39 @@ impl pb::points_server::Points for Api {
             ids,
         }))
     }
+
+    async fn write_batch(
+        &self,
+        request: Request<pb::WriteBatchRequest>,
+    ) -> Result<Response<pb::WriteBatchResponse>, Status> {
+        let req = request.into_inner();
+        if req.collection.is_empty() {
+            return Err(Status::invalid_argument("no collection specified"));
+        }
+        let mut upserts: Vec<(Vec<f32>, Option<vecvec_core::Payload>)> =
+            Vec::with_capacity(req.upserts.len());
+        for v in req.upserts {
+            let payload = match v.payload {
+                Some(json) => Some(
+                    serde_json::from_str(&json)
+                        .map_err(|e| Status::invalid_argument(format!("bad payload: {e}")))?,
+                ),
+                None => None,
+            };
+            upserts.push((v.values, payload));
+        }
+        let commit = req.commit.then_some((req.message, req.tag));
+        let out = self
+            .svc
+            .write_batch(req.collection, upserts, req.deletes, commit)
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new(pb::WriteBatchResponse {
+            ids: out.ids,
+            deleted: out.deleted,
+            version: out.version,
+        }))
+    }
 }
 
 #[tonic::async_trait]

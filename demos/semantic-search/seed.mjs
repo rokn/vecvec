@@ -25,14 +25,47 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+// How many documents to seed. The base corpus is small, so we expand it up to
+// this count by deriving paraphrase-style variants of each document. Override
+// with TARGET_DOCS=… node seed.mjs
+const TARGET_DOCS = Number(process.env.TARGET_DOCS ?? 1000);
+
+// Framings used to derive distinct-but-related variants of a base document, so
+// every entry embeds to a slightly different point instead of a duplicate.
+const FRAMINGS = [
+  (t) => t,
+  (t) => `In short: ${t}`,
+  (t) => `Did you know? ${t}`,
+  (t) => `A key takeaway: ${t}`,
+  (t) => `Worth remembering — ${t}`,
+  (t) => `To put it plainly, ${t.charAt(0).toLowerCase()}${t.slice(1)}`,
+  (t) => `Here is the idea: ${t}`,
+  (t) => `${t} That detail matters in practice.`,
+  (t) => `${t} It comes up often.`,
+  (t) => `Consider this: ${t}`,
+];
+
+// Expand the base corpus to `count` documents by cycling through framings.
+function expandCorpus(base, count) {
+  if (base.length >= count) return base.slice(0, count);
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const doc = base[i % base.length];
+    const frame = FRAMINGS[Math.floor(i / base.length) % FRAMINGS.length];
+    out.push({ text: frame(doc.text), category: doc.category ?? null });
+  }
+  return out;
+}
+
 async function main() {
   const cfg = loadConfig();
   const corpusPath = process.argv[2] ?? join(HERE, "corpus.json");
-  const corpus = JSON.parse(readFileSync(corpusPath, "utf8"));
+  const base = JSON.parse(readFileSync(corpusPath, "utf8"));
+  const corpus = expandCorpus(base, TARGET_DOCS);
 
   console.log(`▸ embedder : ${cfg.embedder.model} @ ${cfg.embedder.baseUrl}`);
   console.log(`▸ vecvec   : ${cfg.vecvec.collection} @ ${cfg.vecvec.url} (${cfg.metric})`);
-  console.log(`▸ corpus   : ${corpus.length} documents (${corpusPath})\n`);
+  console.log(`▸ corpus   : ${corpus.length} documents (${base.length} base × variants, ${corpusPath})\n`);
 
   // Fail fast if the server is down, with a helpful hint.
   await vvHealth(cfg);

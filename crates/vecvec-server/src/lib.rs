@@ -29,14 +29,43 @@ use crate::grpc::Api;
 /// A boxed error usable across `.await` points.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// How often the background maintenance task checkpoints collections.
+/// How often the background maintenance task auto-compacts + checkpoints
+/// collections. This also bounds the resolution of the compaction time trigger.
 const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Builds the auto-compaction policy from the environment:
+/// - `VECVEC_COMPACT_MAX_SEGMENTS` — compact at this many working segments
+///   (default `8`; set `0` to disable the segment-count trigger).
+/// - `VECVEC_COMPACT_INTERVAL_SECS` — compact this often (default `300`; set `0`
+///   to disable the time trigger).
+///
+/// An unset var uses the default; an explicit `0` (or unparseable value) disables
+/// that trigger. Both disabled = manual compaction only.
+pub fn compaction_policy_from_env() -> vecvec_core::CompactionPolicy {
+    let max_segments = match std::env::var("VECVEC_COMPACT_MAX_SEGMENTS") {
+        Ok(s) => s.parse::<usize>().ok().filter(|&n| n > 0),
+        Err(_) => Some(8),
+    };
+    let interval_ms = match std::env::var("VECVEC_COMPACT_INTERVAL_SECS") {
+        Ok(s) => s
+            .parse::<u64>()
+            .ok()
+            .filter(|&n| n > 0)
+            .map(|secs| secs * 1000),
+        Err(_) => Some(300_000),
+    };
+    vecvec_core::CompactionPolicy {
+        max_segments,
+        interval_ms,
+    }
+}
 
 /// Serves the gRPC API (collections + points + query, with health and reflection)
 /// on `listener` until the process is shut down.
 pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), BoxError> {
-    // Background maintenance: periodically checkpoint every collection (folds the
-    // WAL into sealed segments, keeping recovery fast). Cancelled on shutdown.
+    // Background maintenance: periodically auto-compact (if a collection's trigger
+    // fired) and checkpoint every collection (folding the WAL into sealed segments,
+    // keeping recovery fast). Cancelled on shutdown.
     let maintenance = {
         let service = service.clone();
         tokio::spawn(async move {
@@ -45,7 +74,17 @@ pub async fn serve(service: Arc<Service>, listener: TcpListener) -> Result<(), B
             loop {
                 ticker.tick().await;
                 for collection in service.registry().snapshot() {
-                    let _ = tokio::task::spawn_blocking(move || collection.checkpoint()).await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        // A compaction checkpoints itself, so only checkpoint
+                        // separately when nothing compacted. Both fold the WAL.
+                        match collection.maybe_compact() {
+                            Ok(Some(_)) => {}
+                            _ => {
+                                let _ = collection.checkpoint();
+                            }
+                        }
+                    })
+                    .await;
                 }
             }
         })

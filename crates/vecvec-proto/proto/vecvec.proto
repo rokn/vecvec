@@ -46,9 +46,40 @@ message UpsertResponse {
   repeated uint64 ids = 2;
 }
 
+// An atomic mixed write: deletes + upserts applied as one indivisible batch
+// under a single WAL lock (so concurrent readers and crash recovery see all of
+// it or none). Optionally commits a new version afterwards, under the same lock,
+// so the version's boundary is exactly this batch — the closest thing the engine
+// offers to a transaction.
+message WriteBatchRequest {
+  string collection = 1;
+  // Vectors to upsert; server-assigned ids are returned in WriteBatchResponse.
+  repeated Vector upserts = 2;
+  // Point ids to tombstone.
+  repeated uint64 deletes = 3;
+  // If true, commit a new version after the batch is applied.
+  bool commit = 4;
+  // Commit metadata; only used when commit = true.
+  optional string message = 5;
+  optional string tag = 6;
+}
+
+message WriteBatchResponse {
+  // Server-assigned ids for the upserted vectors, in input order.
+  repeated uint64 ids = 1;
+  // How many of the requested deletes were newly applied (missing or
+  // already-deleted ids don't count).
+  uint64 deleted = 2;
+  // The version created if this batch committed, else absent.
+  optional uint64 version = 3;
+}
+
 service Points {
   // Client-streaming bulk insert: many UpsertRequest batches -> one response.
   rpc Upsert(stream UpsertRequest) returns (UpsertResponse);
+  // Atomic mixed delete + upsert, with optional commit-after (a transaction-like
+  // unit of work).
+  rpc WriteBatch(WriteBatchRequest) returns (WriteBatchResponse);
 }
 
 // ---- Query ----

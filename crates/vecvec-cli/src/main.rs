@@ -39,6 +39,27 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Atomic mixed write: upsert from a JSONL file and/or delete ids, applied as
+    /// one indivisible batch, optionally committing a version after (transaction-like).
+    Batch {
+        #[arg(long, default_value = "http://127.0.0.1:6334")]
+        addr: String,
+        #[arg(long)]
+        collection: String,
+        /// JSONL file of vectors to upsert (same format as `upsert`).
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Comma-separated point ids to delete (e.g. `--delete 1,2,3`).
+        #[arg(long, value_delimiter = ',')]
+        delete: Vec<u64>,
+        /// Commit a new version after the batch is applied.
+        #[arg(long)]
+        commit: bool,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+    },
     /// Nearest-neighbor query with a comma-separated vector.
     Query {
         #[arg(long, default_value = "http://127.0.0.1:6334")]
@@ -85,6 +106,27 @@ enum Command {
     },
 }
 
+/// Parses a JSONL file of `{"vector":[...],"payload":{...}}` lines into wire vectors.
+fn parse_vectors_jsonl(path: &std::path::Path) -> Result<Vec<pb::Vector>, BoxError> {
+    let text = std::fs::read_to_string(path)?;
+    let mut vectors = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line)?;
+        let values: Vec<f32> = v["vector"]
+            .as_array()
+            .ok_or("missing 'vector'")?
+            .iter()
+            .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+            .collect();
+        let payload = v
+            .get("payload")
+            .filter(|p| !p.is_null())
+            .map(|p| p.to_string());
+        vectors.push(pb::Vector { values, payload });
+    }
+    Ok(vectors)
+}
+
 fn metric_code(m: &str) -> Result<i32, BoxError> {
     Ok(match m {
         "cosine" => pb::Metric::Cosine as i32,
@@ -115,22 +157,7 @@ async fn main() -> Result<(), BoxError> {
             collection,
             file,
         } => {
-            let text = std::fs::read_to_string(&file)?;
-            let mut vectors = Vec::new();
-            for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                let v: serde_json::Value = serde_json::from_str(line)?;
-                let values: Vec<f32> = v["vector"]
-                    .as_array()
-                    .ok_or("missing 'vector'")?
-                    .iter()
-                    .map(|x| x.as_f64().unwrap_or(0.0) as f32)
-                    .collect();
-                let payload = v
-                    .get("payload")
-                    .filter(|p| !p.is_null())
-                    .map(|p| p.to_string());
-                vectors.push(pb::Vector { values, payload });
-            }
+            let vectors = parse_vectors_jsonl(&file)?;
             let n = vectors.len();
             let mut client = pb::points_client::PointsClient::connect(addr).await?;
             let stream = tokio_stream::iter(std::iter::once(pb::UpsertRequest {
@@ -142,6 +169,43 @@ async fn main() -> Result<(), BoxError> {
                 "upserted {} (ids {}..)",
                 n,
                 resp.ids.first().copied().unwrap_or(0)
+            );
+        }
+        Command::Batch {
+            addr,
+            collection,
+            file,
+            delete,
+            commit,
+            message,
+            tag,
+        } => {
+            let upserts = match &file {
+                Some(path) => parse_vectors_jsonl(path)?,
+                None => Vec::new(),
+            };
+            let mut client = pb::points_client::PointsClient::connect(addr).await?;
+            let resp = client
+                .write_batch(pb::WriteBatchRequest {
+                    collection,
+                    upserts,
+                    deletes: delete,
+                    commit,
+                    message,
+                    tag,
+                })
+                .await?
+                .into_inner();
+            let committed = resp
+                .version
+                .map(|v| format!(", committed v{v}"))
+                .unwrap_or_default();
+            println!(
+                "upserted {} (ids {}..), deleted {}{}",
+                resp.ids.len(),
+                resp.ids.first().copied().unwrap_or(0),
+                resp.deleted,
+                committed,
             );
         }
         Command::Query {

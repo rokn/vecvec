@@ -125,6 +125,17 @@ export function GraphScope() {
     };
   }, [points, projection]);
 
+  // ── Esc clears the selection and the neighbour view ───────────────────────
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (selected != null) selectPoint(null);
+      if (highlight) clearHighlight();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, selectPoint, highlight, clearHighlight]);
+
   // ── canvas sizing ─────────────────────────────────────────────────────────
   useEffect(() => {
     const wrap = wrapRef.current;

@@ -24,14 +24,14 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::collection::{Collection, CollectionConfig, ScoredGlobal};
+use crate::collection::{Collection, CollectionConfig, CompactionPolicy, ScoredGlobal};
 use crate::error::{CoreError, Result};
 use crate::id::{GlobalId, SegmentId};
 use crate::payload::{Filter, Payload, PayloadMap};
 use crate::persist::atomic::{FileKind, read_framed, write_atomic};
 use crate::persist::wal::{Wal, WalOp};
 use crate::segment::SegmentStore;
-use crate::version::DeletionVector;
+use crate::version::{Clock, DeletionVector};
 
 const HEAD_FORMAT_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "config";
@@ -90,6 +90,64 @@ struct WalState {
     generation: u64,
 }
 
+/// The outcome of an atomic [`DurableCollection::write_batch`].
+#[derive(Debug, Clone, Default)]
+pub struct WriteBatchResult {
+    /// Server-assigned ids for the upserted vectors, in input order.
+    pub ids: Vec<u64>,
+    /// How many of the requested deletes were newly applied (missing or
+    /// already-deleted ids don't count).
+    pub deleted: u64,
+    /// The version created if this batch produced a commit — either the explicit
+    /// `commit` request or an auto-commit policy firing — else `None`.
+    pub version: Option<u64>,
+}
+
+/// Tracks progress toward the next automatic compaction. Triggers are OR-ed:
+/// segment count reaching the policy's `max_segments`, and/or `interval_ms`
+/// elapsed since the last compaction. Time is taken from an injectable [`Clock`]
+/// so the interval trigger is deterministically testable (mirrors
+/// [`TriggerEvaluator`](crate::version::TriggerEvaluator) for commits).
+#[derive(Debug, Clone)]
+pub struct CompactionTrigger {
+    policy: CompactionPolicy,
+    last_compaction_ms: u64,
+}
+
+impl CompactionTrigger {
+    /// Creates a trigger anchored at the current time.
+    pub fn new(policy: CompactionPolicy, clock: &dyn Clock) -> Self {
+        Self {
+            policy,
+            last_compaction_ms: clock.now_ms(),
+        }
+    }
+
+    /// Whether compaction should fire given the current sealed-segment count.
+    /// Never fires with `<= 1` segment — there is nothing to merge.
+    pub fn should_compact(&self, segment_count: usize, clock: &dyn Clock) -> bool {
+        if segment_count <= 1 {
+            return false;
+        }
+        if let Some(max) = self.policy.max_segments
+            && segment_count >= max
+        {
+            return true;
+        }
+        if let Some(ms) = self.policy.interval_ms
+            && clock.now_ms().saturating_sub(self.last_compaction_ms) >= ms
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Records that a compaction happened, resetting the time trigger.
+    pub fn note_compaction(&mut self, clock: &dyn Clock) {
+        self.last_compaction_ms = clock.now_ms();
+    }
+}
+
 /// A collection with durable, crash-recoverable storage.
 pub struct DurableCollection {
     collection: Arc<Collection>,
@@ -98,6 +156,8 @@ pub struct DurableCollection {
     wal: Mutex<WalState>,
     fsync: FsyncMode,
     trigger: Mutex<crate::version::TriggerEvaluator>,
+    /// Tracks when to auto-compact (segment-count / time triggers).
+    compaction: Mutex<CompactionTrigger>,
     clock: crate::version::SystemClock,
     /// Segment ids already written to disk (so commits don't rewrite them).
     persisted_segments: Mutex<std::collections::HashSet<SegmentId>>,
@@ -111,6 +171,7 @@ impl DurableCollection {
         write_config_if_absent(&dir, &config)?;
         let store = SegmentStore::new(dir.join("segments"));
         let policy = config.versioning;
+        let compaction_policy = config.compaction;
         let collection = Arc::new(Collection::create(config));
         let clock = crate::version::SystemClock;
 
@@ -177,6 +238,7 @@ impl DurableCollection {
             wal: Mutex::new(WalState { wal, generation }),
             fsync,
             trigger: Mutex::new(crate::version::TriggerEvaluator::new(policy, &clock)),
+            compaction: Mutex::new(CompactionTrigger::new(compaction_policy, &clock)),
             clock,
             persisted_segments: Mutex::new(persisted),
         })
@@ -248,10 +310,35 @@ impl DurableCollection {
     }
 
     /// Durably appends a batch of `(vector, payload)` points, returning their ids.
-    /// WAL-first: logged + fsynced before applied in memory.
+    /// WAL-first: logged + fsynced before applied in memory. A thin wrapper over
+    /// [`write_batch`](Self::write_batch) with no deletes and no explicit commit.
     pub fn upsert(&self, points: Vec<(Vec<f32>, Option<Payload>)>) -> Result<Vec<u64>> {
+        Ok(self.write_batch(points, Vec::new(), None)?.ids)
+    }
+
+    /// Atomically applies a mixed batch of deletes + upserts under a single WAL
+    /// lock, so the whole batch is indivisible to concurrent readers and to crash
+    /// recovery (all of it survives, or none). WAL-first: every op is logged and
+    /// fsynced once for the batch before any is applied in memory.
+    ///
+    /// `commit` is `Some((message, tag))` to commit a new version after the batch.
+    /// That commit runs **while the WAL lock is still held**, so no concurrent
+    /// write can interleave between the batch and its version boundary — the
+    /// version reflects exactly this batch (plus everything committed before it).
+    /// Beware: a commit seals a segment and writes a manifest, so committing on
+    /// every batch fragments segments and adds latency; use it for meaningful
+    /// transaction boundaries, not high-frequency writes.
+    ///
+    /// Deletes, like the standalone [`delete`](Self::delete) path, do not advance
+    /// the auto-commit write trigger; only upserts do.
+    pub fn write_batch(
+        &self,
+        upserts: Vec<(Vec<f32>, Option<Payload>)>,
+        deletes: Vec<u64>,
+        commit: Option<(Option<String>, Option<String>)>,
+    ) -> Result<WriteBatchResult> {
         let dim = self.collection.config().dim;
-        for (v, _) in &points {
+        for (v, _) in &upserts {
             if v.len() != dim {
                 return Err(CoreError::DimensionMismatch {
                     expected: dim,
@@ -261,8 +348,12 @@ impl DurableCollection {
         }
 
         let mut guard = self.wal.lock();
-        let mut ids = Vec::with_capacity(points.len());
-        for (v, payload) in &points {
+        // WAL-first: log deletes then upserts; one fsync covers the whole batch.
+        for id in &deletes {
+            guard.wal.append(&WalOp::Delete { id: *id })?;
+        }
+        let mut ids = Vec::with_capacity(upserts.len());
+        for (v, payload) in &upserts {
             let id = self.collection.alloc_global_id();
             guard.wal.append(&WalOp::Upsert {
                 id: id.get(),
@@ -274,29 +365,58 @@ impl DurableCollection {
         if self.fsync == FsyncMode::Sync {
             guard.wal.flush()?;
         }
-        // Durable -> apply in memory (the same path recovery uses).
-        for (id, (v, payload)) in ids.iter().zip(points) {
+        // Durable -> apply in memory (the same path recovery uses), same order.
+        let mut deleted = 0u64;
+        for id in &deletes {
+            if self.collection.delete(GlobalId::new(*id)) {
+                deleted += 1;
+            }
+        }
+        for (id, (v, payload)) in ids.iter().zip(upserts) {
             self.collection
                 .insert_with_id_and_payload(GlobalId::new(*id), &v, payload)?;
         }
+
+        // Explicit commit, under the still-held WAL lock, so the version boundary
+        // is exactly this batch (no concurrent writer can hold the lock meanwhile).
+        let explicit = match commit {
+            Some((message, tag)) => {
+                let v = self.collection.commit("batch", message, tag)?;
+                self.persist_versions()?;
+                Some(v)
+            }
+            None => None,
+        };
         drop(guard);
 
-        // Auto-commit if the versioning policy's trigger has fired.
-        let committed = {
+        // Version bookkeeping. An explicit commit resets the auto-commit trigger;
+        // otherwise honor the policy-based auto-commit (as plain `upsert` does).
+        let version = if let Some(v) = explicit {
             let mut trigger = self.trigger.lock();
             trigger.record_writes(ids.len() as u64);
-            if trigger.should_commit(&self.clock) {
-                self.collection.commit("auto", None, None)?;
-                trigger.note_commit(&self.clock);
-                true
+            trigger.note_commit(&self.clock);
+            Some(v)
+        } else {
+            let fire = {
+                let mut trigger = self.trigger.lock();
+                trigger.record_writes(ids.len() as u64);
+                trigger.should_commit(&self.clock)
+            };
+            if fire {
+                let v = self.collection.commit("auto", None, None)?;
+                self.trigger.lock().note_commit(&self.clock);
+                self.persist_versions()?;
+                Some(v)
             } else {
-                false
+                None
             }
         };
-        if committed {
-            self.persist_versions()?;
-        }
-        Ok(ids)
+
+        Ok(WriteBatchResult {
+            ids,
+            deleted,
+            version,
+        })
     }
 
     /// Explicitly commits the working state as a new version.
@@ -363,6 +483,27 @@ impl DurableCollection {
         let merged = self.collection.compact().map(|id| id.get());
         if merged.is_some() {
             self.checkpoint()?;
+        }
+        Ok(merged)
+    }
+
+    /// Compacts the working set iff the collection's [`CompactionPolicy`] trigger
+    /// has fired (segment-count or elapsed-time); a no-op (`Ok(None)`) otherwise.
+    /// Intended to be polled by the server's background maintenance loop so the
+    /// (graph-rebuilding) compaction runs off the write path. On compaction the
+    /// time trigger is reset.
+    pub fn maybe_compact(&self) -> Result<Option<u64>> {
+        let segment_count = self.collection.sealed_count();
+        let fire = self
+            .compaction
+            .lock()
+            .should_compact(segment_count, &self.clock);
+        if !fire {
+            return Ok(None);
+        }
+        let merged = self.compact()?;
+        if merged.is_some() {
+            self.compaction.lock().note_compaction(&self.clock);
         }
         Ok(merged)
     }
@@ -597,6 +738,130 @@ mod tests {
         }
         let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
         assert_eq!(dc.len(), 40); // 30 from the sealed segment + 10 replayed from WAL
+    }
+
+    #[test]
+    fn write_batch_atomic_delete_upsert_and_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+        let seed = dc
+            .upsert((0..10).map(|i| (vecf(8, i), None)).collect())
+            .unwrap();
+        assert_eq!(dc.len(), 10);
+
+        // One atomic unit: drop 2 seed points, add 3 new ones, commit a version.
+        let out = dc
+            .write_batch(
+                (10..13).map(|i| (vecf(8, i), None)).collect(),
+                vec![seed[0], seed[1]],
+                Some((Some("tx".into()), Some("v1".into()))),
+            )
+            .unwrap();
+        assert_eq!(out.ids.len(), 3);
+        assert_eq!(out.deleted, 2);
+        assert_eq!(out.version, Some(0));
+        assert_eq!(dc.len(), 11); // 10 - 2 + 3
+        assert_eq!(dc.list_versions().len(), 1);
+
+        // Re-deleting / unknown ids don't count, and no-commit yields no version.
+        let out2 = dc.write_batch(vec![], vec![seed[0], 99_999], None).unwrap();
+        assert_eq!(out2.deleted, 0);
+        assert_eq!(out2.version, None);
+        assert_eq!(dc.len(), 11);
+    }
+
+    #[test]
+    fn write_batch_is_durable_across_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        {
+            let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
+            let seed = dc
+                .upsert((0..5).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
+            // Mixed batch, no commit — must still be WAL-durable as a unit.
+            dc.write_batch(
+                (5..8).map(|i| (vecf(8, i), None)).collect(),
+                vec![seed[0]],
+                None,
+            )
+            .unwrap();
+            assert_eq!(dc.len(), 7); // 5 - 1 + 3
+            // crash: drop without checkpoint
+        }
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+        assert_eq!(dc.len(), 7); // delete + 3 upserts replayed from the WAL
+    }
+
+    #[test]
+    fn compaction_trigger_segment_count_and_time() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct ManualClock(AtomicU64);
+        impl Clock for ManualClock {
+            fn now_ms(&self) -> u64 {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+        let clock = ManualClock(AtomicU64::new(0));
+
+        // Segment-count trigger: fires at >= max_segments, never with <= 1 segment.
+        let t = CompactionTrigger::new(
+            CompactionPolicy {
+                max_segments: Some(3),
+                interval_ms: None,
+            },
+            &clock,
+        );
+        assert!(!t.should_compact(1, &clock));
+        assert!(!t.should_compact(2, &clock));
+        assert!(t.should_compact(3, &clock));
+        assert!(t.should_compact(4, &clock));
+
+        // Time trigger: fires once the interval elapsed AND there's >1 segment.
+        let mut t = CompactionTrigger::new(
+            CompactionPolicy {
+                max_segments: None,
+                interval_ms: Some(1000),
+            },
+            &clock,
+        );
+        assert!(!t.should_compact(5, &clock)); // no time elapsed yet
+        clock.0.store(1000, Ordering::Relaxed);
+        assert!(!t.should_compact(1, &clock)); // elapsed, but nothing to merge
+        assert!(t.should_compact(2, &clock)); // elapsed + mergeable
+        t.note_compaction(&clock);
+        assert!(!t.should_compact(2, &clock)); // just compacted, timer reset
+    }
+
+    #[test]
+    fn maybe_compact_fires_on_segment_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        cfg.compaction = CompactionPolicy {
+            max_segments: Some(3),
+            interval_ms: None,
+        };
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+
+        // Each commit seals the appendable into its own sealed segment.
+        for b in 0..3 {
+            dc.upsert((0..5).map(|i| (vecf(8, b * 5 + i), None)).collect())
+                .unwrap();
+            dc.commit(None, None).unwrap();
+        }
+        assert_eq!(dc.collection().sealed_count(), 3);
+        assert_eq!(dc.len(), 15);
+
+        // Trigger fires (>=3 segments) → merges them into a single segment.
+        let merged = dc.maybe_compact().unwrap();
+        assert!(merged.is_some());
+        assert_eq!(dc.collection().sealed_count(), 1);
+        assert_eq!(dc.len(), 15); // no points lost
+
+        // Below threshold now → no-op.
+        assert!(dc.maybe_compact().unwrap().is_none());
+        assert_eq!(dc.collection().sealed_count(), 1);
     }
 
     proptest::proptest! {
