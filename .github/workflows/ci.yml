@@ -80,3 +80,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  go-sdk:
+    name: go-sdk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: sdk/go/go.sum
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # protoc plugins for the Makefile's `generate` target.
+      - run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+      # Regenerate the stubs from the canonical crate proto and fail if the
+      # checked-in gen/ output drifted (i.e. someone edited vecvec.proto without
+      # running `make generate`).
+      - run: make generate
+        working-directory: sdk/go
+      - run: git diff --exit-code sdk/go/gen
+      - run: make build
+        working-directory: sdk/go
+      - run: go test ./...
+        working-directory: sdk/go
