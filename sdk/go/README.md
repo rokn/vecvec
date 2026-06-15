@@ -6,7 +6,7 @@ stubs in an ergonomic `Client`.
 ## Install
 
 ```sh
-go get github.com/vecvec/vecvec-go
+go get gitea.mindov.casa/rokn/vecvec/sdk/go
 ```
 
 ## Usage

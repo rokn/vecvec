@@ -2,6 +2,9 @@ syntax = "proto3";
 
 package vecvec.v1;
 
+// Go-only option, ignored by prost/tonic; used by the Go SDK's protoc run.
+option go_package = "gitea.mindov.casa/rokn/vecvec/sdk/go/gen/vecvec/v1;vecvecv1";
+
 // The distance metric a collection ranks by.
 enum Metric {
   METRIC_UNSPECIFIED = 0;

@@ -1,19 +1,19 @@
-SRC_PROTO := ../../crates/vecvec-proto/proto/vecvec.proto
-DST_PROTO := proto/vecvec/v1/vecvec.proto
-GO_PACKAGE := github.com/vecvec/vecvec-go/gen/vecvec/v1;vecvecv1
+PROTO_DIR := ../../crates/vecvec-proto/proto
+PROTO := vecvec.proto
+GEN_MODULE := gitea.mindov.casa/rokn/vecvec/sdk/go/gen
 
 .PHONY: generate build
 
-# Sync the proto from the upstream crate (re-adding the Go-only go_package
-# option) and regenerate the gRPC stubs into gen/.
+# Regenerate the gRPC stubs directly from the upstream crate proto, which
+# carries the go_package option. No local proto copy is kept. module= mode
+# derives the output path from go_package (gen/vecvec/v1/) instead of the
+# proto's location, which sits at the crate include-dir root.
 generate:
-	mkdir -p proto/vecvec/v1 gen
-	printf 'syntax = "proto3";\n\npackage vecvec.v1;\n\noption go_package = "$(GO_PACKAGE)";\n' > $(DST_PROTO)
-	sed '1,3d' $(SRC_PROTO) >> $(DST_PROTO)
-	protoc -I proto \
-		--go_out=gen --go_opt=paths=source_relative \
-		--go-grpc_out=gen --go-grpc_opt=paths=source_relative \
-		$(DST_PROTO)
+	mkdir -p gen
+	protoc -I $(PROTO_DIR) \
+		--go_out=gen --go_opt=module=$(GEN_MODULE) \
+		--go-grpc_out=gen --go-grpc_opt=module=$(GEN_MODULE) \
+		$(PROTO)
 
 build:
 	go build ./...

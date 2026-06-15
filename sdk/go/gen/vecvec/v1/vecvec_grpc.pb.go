@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             v7.34.1
-// source: vecvec/v1/vecvec.proto
+// source: vecvec.proto
 
 package vecvecv1
 
@@ -117,7 +117,7 @@ var Collections_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "vecvec/v1/vecvec.proto",
+	Metadata: "vecvec.proto",
 }
 
 const (
@@ -257,7 +257,7 @@ var Points_ServiceDesc = grpc.ServiceDesc{
 			ClientStreams: true,
 		},
 	},
-	Metadata: "vecvec/v1/vecvec.proto",
+	Metadata: "vecvec.proto",
 }
 
 const (
@@ -399,7 +399,7 @@ var Query_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "vecvec/v1/vecvec.proto",
+	Metadata: "vecvec.proto",
 }
 
 const (
@@ -691,5 +691,5 @@ var Versioning_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "vecvec/v1/vecvec.proto",
+	Metadata: "vecvec.proto",
 }

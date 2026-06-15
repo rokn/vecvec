@@ -1,4 +1,4 @@
-module github.com/vecvec/vecvec-go
+module gitea.mindov.casa/rokn/vecvec/sdk/go
 
 go 1.26
 
