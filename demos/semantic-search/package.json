@@ -1,0 +1,11 @@
+{
+  "name": "vecvec-semantic-search-demo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Seed vecvec with embeddings from a local Ollama model, then run semantic search.",
+  "scripts": {
+    "seed": "node seed.mjs",
+    "query": "node query.mjs"
+  }
+}
