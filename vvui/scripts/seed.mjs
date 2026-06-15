@@ -128,6 +128,63 @@ async function seedPixels() {
   console.log("  ◈ commit more samples");
 }
 
+async function seedStream() {
+  // A long-lived collection that grows on every commit, so the timeline has lots
+  // of versions. Total point count scales linearly from 1 to ~10000 across 100
+  // commits, so every commit adds roughly the same number of points (~100).
+  const name = "stream-32d";
+  const dim = 32;
+  const sources = ["sensor", "log", "trace", "metric", "event"];
+  const centers = clusterCenters(sources.length, dim);
+
+  await ensureFresh(name, dim, "cosine");
+  console.log(`\n▸ ${name} · ${dim}d · cosine`);
+
+  const batch = (n, hour) =>
+    Array.from({ length: n }, () => {
+      const t = Math.floor(rnd() * sources.length);
+      return {
+        vector: near(centers[t], 0.4),
+        payload: {
+          source: sources[t],
+          hour,
+          score: Math.round(rnd() * 1000) / 1000,
+        },
+      };
+    });
+
+  const COMMITS = 100;
+  const TARGET = 10000;
+  // Linear schedule: cumulative count at commit i is TARGET * i / COMMITS,
+  // so each commit adds roughly the same number of points.
+  let total = 0;
+  for (let i = 1; i <= COMMITS; i++) {
+    const want = Math.round((TARGET * i) / COMMITS);
+    const n = Math.max(1, want - total);
+
+    const r = await api("POST", `/collections/${name}/points`, { points: batch(n, i) });
+    total += r.inserted;
+
+    // occasionally tombstone a few older points to keep diffs interesting
+    let pruned = 0;
+    if (i % 10 === 0) {
+      for (let k = 0; k < 3; k++) {
+        const id = Math.floor(rnd() * total);
+        await api("DELETE", `/collections/${name}/points/${id}`)
+          .then(() => pruned++)
+          .catch(() => {});
+      }
+    }
+
+    const tag = i === 1 ? "genesis" : i % 25 === 0 ? `h${i}` : undefined;
+    const msg = pruned
+      ? `commit ${i}: +${r.inserted}, −${pruned} (total ${total})`
+      : `commit ${i}: +${r.inserted} (total ${total})`;
+    await api("POST", `/collections/${name}/commit`, { message: msg, tag });
+    console.log(`  ◈ ${msg}${tag ? ` @${tag}` : ""}`);
+  }
+}
+
 async function main() {
   console.log(`seeding vecvec @ ${BASE}`);
   try {
@@ -138,6 +195,7 @@ async function main() {
   }
   await seedConcepts();
   await seedPixels();
+  await seedStream();
   console.log("\n✓ done — open the SCOPE and explore.\n");
 }
 

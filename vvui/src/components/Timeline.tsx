@@ -1,7 +1,6 @@
 import { useMemo, useState } from "react";
 import { useStore } from "../store";
 import { clockTime, relTime } from "../lib/format";
-import type { VersionInfo } from "../types";
 import { Modal } from "./Modal";
 
 export function Timeline() {
@@ -26,12 +25,12 @@ export function Timeline() {
   const focused = viewVersion ?? head;
   const focusedInfo = sorted.find((v) => v.version === focused) ?? null;
 
-  const positions = useMemo(() => layoutTicks(sorted), [sorted]);
-
   if (!stats) return <div className="timeline" />;
 
   const live = viewVersion == null;
-  const idx = focused != null ? sorted.findIndex((v) => v.version === focused) : -1;
+  const rawIdx = focused != null ? sorted.findIndex((v) => v.version === focused) : -1;
+  // index of the commit the camera centers on
+  const camIdx = rawIdx < 0 ? sorted.length - 1 : rawIdx;
 
   return (
     <div className="timeline">
@@ -95,29 +94,46 @@ export function Timeline() {
         <div className="timeline-track-wrap">
           <div className="timeline-axis">
             <div className="timeline-baseline" />
-            {sorted.map((v, i) => {
-              const isFocus = v.version === focused;
-              const isHead = v.version === head;
-              const stem = isFocus ? 42 : 28;
-              return (
-                <div
-                  key={v.version}
-                  className={`tick-node ${isFocus ? "sel" : ""} ${isHead ? "head" : ""}`}
-                  style={{ left: `${positions[i]}%` }}
-                  onClick={() => setViewVersion(isHead ? null : v.version)}
-                  title={v.message ?? `version ${v.version}`}
-                >
-                  {(v.trigger === "manual" || isHead) && (
-                    <span className="tick-tag" style={{ color: isHead ? "var(--add)" : undefined }}>
-                      {isHead ? "head" : ""}
-                    </span>
-                  )}
-                  <span className="tick-stem" style={{ height: stem }} />
-                  <span className="tick-dot" />
-                  <span className="tick-label">v{v.version}</span>
-                </div>
-              );
-            })}
+            <div className="timeline-focus-marker" />
+            <div
+              className="timeline-track"
+              style={{ transform: `translateX(${-camIdx * TICK_STEP}px)` }}
+            >
+              {sorted.map((v, i) => {
+                const isFocus = v.version === focused;
+                const isHead = v.version === head;
+                // distance from the camera center, in commits
+                const dist = Math.abs(i - camIdx);
+                // only ~5 commits in view (focus ±2); fade + shrink towards the edges
+                const t = Math.min(1, dist / 3);
+                const opacity = dist > 4 ? 0 : 1 - t * 0.85;
+                const scale = 1 - t * 0.35;
+                const stem = isFocus ? 42 : 28 - t * 8;
+                return (
+                  <div
+                    key={v.version}
+                    className={`tick-node ${isFocus ? "sel" : ""} ${isHead ? "head" : ""}`}
+                    style={{
+                      left: `${i * TICK_STEP}px`,
+                      opacity,
+                      transform: `translateX(-50%) scale(${scale})`,
+                      pointerEvents: dist > 4 ? "none" : "auto",
+                    }}
+                    onClick={() => setViewVersion(isHead ? null : v.version)}
+                    title={v.message ?? `version ${v.version}`}
+                  >
+                    {(v.trigger === "manual" || isHead) && (
+                      <span className="tick-tag" style={{ color: isHead ? "var(--add)" : undefined }}>
+                        {isHead ? "head" : ""}
+                      </span>
+                    )}
+                    <span className="tick-stem" style={{ height: stem }} />
+                    <span className="tick-dot" />
+                    <span className="tick-label">v{v.version}</span>
+                  </div>
+                );
+              })}
+            </div>
           </div>
 
           <div className="spread" style={{ marginTop: 22 }}>
@@ -126,7 +142,7 @@ export function Timeline() {
               type="range"
               min={0}
               max={Math.max(0, sorted.length - 1)}
-              value={idx < 0 ? sorted.length - 1 : idx}
+              value={camIdx}
               onChange={(e) => {
                 const v = sorted[Number(e.target.value)];
                 if (v) setViewVersion(v.version === head ? null : v.version);
@@ -234,16 +250,5 @@ function RefModal({
   );
 }
 
-/** Lay out version ticks by wall-clock time, clamped so labels stay readable. */
-function layoutTicks(versions: VersionInfo[]): number[] {
-  if (versions.length === 0) return [];
-  if (versions.length === 1) return [50];
-  const times = versions.map((v) => v.created_at_ms);
-  const min = Math.min(...times);
-  const max = Math.max(...times);
-  const span = max - min;
-  return versions.map((v, i) => {
-    const t = span > 0 ? (v.created_at_ms - min) / span : i / (versions.length - 1);
-    return 4 + t * 92;
-  });
-}
+/** Pixel spacing between adjacent commits on the timeline track. */
+const TICK_STEP = 88;

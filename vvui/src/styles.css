@@ -542,12 +542,13 @@ select.input:focus {
   justify-content: space-between;
   gap: 14px;
 }
-.timeline-track-wrap { position: relative; padding: 6px 4px 2px; }
+.timeline-track-wrap { position: relative; padding: 6px 4px 20px; }
 .timeline-axis {
   position: relative;
   height: 52px;
-  border-left: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
+  /* no overflow clip: edge commits fade via per-tick opacity so the v* labels
+     below the baseline stay visible */
 }
 .timeline-baseline {
   position: absolute;
@@ -555,15 +556,34 @@ select.input:focus {
   height: 1px;
   background: var(--line-bright);
 }
+/* fixed crosshair at the camera center — the focused commit slides under it */
+.timeline-focus-marker {
+  position: absolute;
+  left: 50%; bottom: 0;
+  width: 1px; height: 100%;
+  background: linear-gradient(180deg, transparent, var(--phosphor-dim) 60%, transparent);
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 0;
+}
+/* the panning track: origin at the viewport center, translated to center the focus */
+.timeline-track {
+  position: absolute;
+  left: 50%; bottom: 0; top: 0;
+  width: 0;
+  transition: transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
 .tick-node {
   position: absolute;
   bottom: 0;
   transform: translateX(-50%);
+  transform-origin: bottom center;
   display: flex;
   flex-direction: column;
   align-items: center;
   cursor: pointer;
   pointer-events: auto;
+  transition: opacity 0.5s ease, transform 0.5s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .tick-stem {
   width: 1px;
@@ -599,6 +619,7 @@ select.input:focus {
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.04em;
 }
+.tick-node.sel .tick-label { color: var(--phosphor); font-weight: 600; }
 .tick-tag {
   position: absolute;
   bottom: 100%;

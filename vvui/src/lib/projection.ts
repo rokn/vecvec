@@ -3,7 +3,7 @@ import type { ProjectionKind } from "../types";
 import { pca2d } from "./pca";
 
 /** Cap on how many points we project at once (UMAP especially is superlinear). */
-export const PROJECTION_CAP = 2500;
+export const PROJECTION_CAP = 10000;
 
 function lcg(seed: number): () => number {
   let s = seed >>> 0;
