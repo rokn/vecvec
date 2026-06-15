@@ -32,9 +32,7 @@ pub mod segment;
 pub mod vector;
 pub mod version;
 
-pub use collection::{
-    Collection, CollectionConfig, CompactionPolicy, PointRecord, ScoredGlobal,
-};
+pub use collection::{Collection, CollectionConfig, CompactionPolicy, PointRecord, ScoredGlobal};
 pub use distance::{DistanceKernel, Metric};
 pub use durable::{DurableCollection, FsyncMode, WriteBatchResult, import};
 pub use error::{CoreError, Result};

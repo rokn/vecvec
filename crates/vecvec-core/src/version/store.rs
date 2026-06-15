@@ -400,10 +400,22 @@ mod tests {
     fn set_tag_branch_and_diff_reject_unknown_version() {
         let mut s = VersionStore::new();
         commit(&mut s, vec![seg(0, 0, 9)], &[]);
-        assert!(matches!(s.set_tag("t", 999), Err(VersionError::NoSuchVersion(999))));
-        assert!(matches!(s.set_branch("b", 999), Err(VersionError::NoSuchVersion(999))));
-        assert!(matches!(s.diff(0, 999), Err(VersionError::NoSuchVersion(999))));
-        assert!(matches!(s.diff(999, 0), Err(VersionError::NoSuchVersion(999))));
+        assert!(matches!(
+            s.set_tag("t", 999),
+            Err(VersionError::NoSuchVersion(999))
+        ));
+        assert!(matches!(
+            s.set_branch("b", 999),
+            Err(VersionError::NoSuchVersion(999))
+        ));
+        assert!(matches!(
+            s.diff(0, 999),
+            Err(VersionError::NoSuchVersion(999))
+        ));
+        assert!(matches!(
+            s.diff(999, 0),
+            Err(VersionError::NoSuchVersion(999))
+        ));
     }
 
     #[test]
@@ -440,7 +452,10 @@ mod tests {
             keep_branch_heads: true,
         };
         let r = s.plan_gc(&guarded);
-        assert!(r.removed_versions.is_empty(), "tag/branch/head must protect v0,v1,v2");
+        assert!(
+            r.removed_versions.is_empty(),
+            "tag/branch/head must protect v0,v1,v2"
+        );
         assert!(r.orphan_segments.is_empty());
 
         // Disable the guards: v0 (tag) and v1 (branch) drop; v2 stays (head + keep_last).
@@ -459,7 +474,14 @@ mod tests {
     fn snapshot_round_trip_preserves_tags_branches_head_next_version() {
         let mut s = VersionStore::new();
         let v0 = s
-            .commit("m", Some("first".into()), Some("autotag".into()), vec![seg(0, 0, 9)], dv(&[]), 0)
+            .commit(
+                "m",
+                Some("first".into()),
+                Some("autotag".into()),
+                vec![seg(0, 0, 9)],
+                dv(&[]),
+                0,
+            )
             .version;
         let v1 = commit(&mut s, vec![seg(1, 10, 19)], &[]);
         s.set_branch("dev", v0).unwrap();
@@ -474,7 +496,10 @@ mod tests {
         assert_eq!(s2.head(), Some(v1));
         assert_eq!(s2.resolve(&VersionSelector::Branch("dev".into())), Some(v0));
         assert_eq!(s2.resolve(&VersionSelector::Tag("rel".into())), Some(v1));
-        assert_eq!(s2.resolve(&VersionSelector::Tag("autotag".into())), Some(v0));
+        assert_eq!(
+            s2.resolve(&VersionSelector::Tag("autotag".into())),
+            Some(v0)
+        );
         // next_version restored: a new commit must not reuse an existing id.
         let v2 = commit(&mut s2, vec![seg(2, 20, 29)], &[]);
         assert_eq!(v2, 2);

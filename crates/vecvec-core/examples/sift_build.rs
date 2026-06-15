@@ -25,14 +25,21 @@ fn read_fvecs(path: &Path) -> (usize, Vec<f32>) {
         let d = i32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
         dim = d;
         i += 4;
-        out.extend(bytes[i..i + d * 4].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+        out.extend(
+            bytes[i..i + d * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+        );
         i += d * 4;
     }
     (dim, out)
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Brute-force top-10 (squared L2) over `base[0..n]`, run in parallel over queries.
@@ -54,7 +61,14 @@ fn brute_truth(base: &[f32], dim: usize, n: usize, queries: &[f32], nq: usize) -
         .collect()
 }
 
-fn recall_at(index: &HnswIndex, dim: usize, queries: &[f32], nq: usize, truth: &[Vec<u32>], ef: usize) -> f64 {
+fn recall_at(
+    index: &HnswIndex,
+    dim: usize,
+    queries: &[f32],
+    nq: usize,
+    truth: &[Vec<u32>],
+    ef: usize,
+) -> f64 {
     let mut hits = 0usize;
     for qi in 0..nq {
         let q = &queries[qi * dim..qi * dim + dim];
@@ -71,11 +85,16 @@ fn main() {
     // rayon, and the first par call locks in the global pool size).
     let threads = env_usize("THREADS", 0);
     if threads > 0 {
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .ok();
     }
-    let dir: PathBuf = std::env::var("SIFT_DIR").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/vecvec-sift/sift")
-    });
+    let dir: PathBuf = std::env::var("SIFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/vecvec-sift/sift")
+        });
     let (dim, base_all) = read_fvecs(&dir.join("sift_base.fvecs"));
     let (_, queries_all) = read_fvecs(&dir.join("sift_query.fvecs"));
     let n = env_usize("MAXN", 200_000).min(base_all.len() / dim);
@@ -102,9 +121,14 @@ fn main() {
 
     let r64 = recall_at(&index, dim, &queries_all, nq, &truth, 64);
     let r128 = recall_at(&index, dim, &queries_all, nq, &truth, 128);
-    let thr = if threads > 0 { threads } else { rayon::current_num_threads() };
+    let thr = if threads > 0 {
+        threads
+    } else {
+        rayon::current_num_threads()
+    };
     println!(
         "n={n} efc={efc} quant={} thr={thr} | build {secs:6.2}s | {:8.0} vec/s | recall@10 ef64={r64:.4} ef128={r128:.4}",
-        quant as u8, n as f64 / secs
+        quant as u8,
+        n as f64 / secs
     );
 }

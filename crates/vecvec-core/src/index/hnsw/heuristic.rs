@@ -33,9 +33,7 @@ pub(crate) fn candidates_to(
     let base_vec = unsafe { vectors.get_unchecked(PointId::new(base)) };
     ids.iter()
         .map(|&id| {
-            let s = kernel.score_f32(base_vec, unsafe {
-                vectors.get_unchecked(PointId::new(id))
-            });
+            let s = kernel.score_f32(base_vec, unsafe { vectors.get_unchecked(PointId::new(id)) });
             (badness(s, higher), id)
         })
         .collect()

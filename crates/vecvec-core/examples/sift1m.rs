@@ -31,7 +31,11 @@ fn read_fvecs(path: &Path) -> (usize, Vec<f32>) {
         dim = d;
         i += 4;
         let floats = &bytes[i..i + d * 4];
-        out.extend(floats.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())));
+        out.extend(
+            floats
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+        );
         i += d * 4;
     }
     (dim, out)
@@ -64,13 +68,18 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {
-    let dir: PathBuf = std::env::var("SIFT_DIR").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/vecvec-sift/sift")
-    });
+    let dir: PathBuf = std::env::var("SIFT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/vecvec-sift/sift")
+        });
 
     eprintln!("loading SIFT1M from {}", dir.display());
     let (dim, base) = read_fvecs(&dir.join("sift_base.fvecs"));

@@ -223,7 +223,9 @@ impl<'q> ConcurrentBuilder<'q> {
 
         let mut out: Vec<(OrderedF32, u32)> = results.into_vec();
         out.sort_unstable();
-        out.into_iter().map(|(b, id)| (b.into_inner(), id)).collect()
+        out.into_iter()
+            .map(|(b, id)| (b.into_inner(), id))
+            .collect()
     }
 
     /// Re-applies the degree bound to `list` (a node's neighbor list at `layer`),
@@ -231,8 +233,10 @@ impl<'q> ConcurrentBuilder<'q> {
     fn enforce_bound(&self, base: u32, layer: usize, list: &mut Vec<u32>) {
         let max_conn = self.max_conn(layer);
         if list.len() > max_conn {
-            let cand: Vec<(f32, u32)> =
-                list.iter().map(|&id| (self.dist_ids(base, id), id)).collect();
+            let cand: Vec<(f32, u32)> = list
+                .iter()
+                .map(|&id| (self.dist_ids(base, id), id))
+                .collect();
             *list = self.select_ids(base, &cand, max_conn);
         }
     }
@@ -265,7 +269,14 @@ impl<'q> ConcurrentBuilder<'q> {
         // Phase 2: from min(level, top) down to 0, find neighbors and wire up.
         let top = level.min(start_level);
         for layer in (0..=top).rev() {
-            let w = self.search_layer(layer, &ep, self.config.ef_construction, &dist, visited, nbuf);
+            let w = self.search_layer(
+                layer,
+                &ep,
+                self.config.ef_construction,
+                &dist,
+                visited,
+                nbuf,
+            );
             let max_conn = self.max_conn(layer);
             let selected = self.select_ids(point, &w, max_conn);
 
@@ -313,8 +324,7 @@ impl<'q> ConcurrentBuilder<'q> {
     fn into_graph_layers(self) -> GraphLayers {
         let n = self.levels.len();
         let entry_state = self.entry.into_inner();
-        let links: Vec<Vec<Vec<u32>>> =
-            self.links.into_iter().map(|m| m.into_inner()).collect();
+        let links: Vec<Vec<Vec<u32>>> = self.links.into_iter().map(|m| m.into_inner()).collect();
 
         let mut l0_offsets = Vec::with_capacity(n + 1);
         let mut l0_links = Vec::new();

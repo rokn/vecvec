@@ -41,7 +41,11 @@ fn brute_force_top10(storage: &VectorStorage, query: &[f32]) -> Vec<PointId> {
         })
         .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
-    scored.into_iter().take(10).map(|(_, i)| PointId::new(i)).collect()
+    scored
+        .into_iter()
+        .take(10)
+        .map(|(_, i)| PointId::new(i))
+        .collect()
 }
 
 /// Mean recall@10 of the HNSW index against brute force over `n_queries` queries.

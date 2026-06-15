@@ -115,7 +115,10 @@ mod tests {
         }
         let observed = peak.load(Ordering::SeqCst);
         assert!(observed >= 1);
-        assert!(observed <= 2, "peak in-flight {observed} exceeded max_inflight=2");
+        assert!(
+            observed <= 2,
+            "peak in-flight {observed} exceeded max_inflight=2"
+        );
     }
 
     #[tokio::test]

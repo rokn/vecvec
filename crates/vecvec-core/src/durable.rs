@@ -817,7 +817,11 @@ mod tests {
                             .map(|i| (vecf(8, t * 1000 + b * 10 + i), None))
                             .collect::<Vec<_>>();
                         let out = dc
-                            .write_batch(upserts, Vec::new(), Some((Some(format!("t{t}b{b}")), None)))
+                            .write_batch(
+                                upserts,
+                                Vec::new(),
+                                Some((Some(format!("t{t}b{b}")), None)),
+                            )
                             .unwrap();
                         assert_eq!(out.ids.len(), per_batch);
                         assert!(out.version.is_some());
@@ -827,7 +831,11 @@ mod tests {
         });
 
         let total = threads * batches * per_batch;
-        assert_eq!(dc.len(), total, "upserts lost or duplicated under concurrency");
+        assert_eq!(
+            dc.len(),
+            total,
+            "upserts lost or duplicated under concurrency"
+        );
         assert_eq!(
             dc.list_versions().len(),
             threads * batches,
@@ -913,9 +921,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = CollectionConfig::new("c", 8, Metric::Dot);
         let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
-        let a = dc.upsert((0..10).map(|i| (vecf(8, i), None)).collect()).unwrap();
+        let a = dc
+            .upsert((0..10).map(|i| (vecf(8, i), None)).collect())
+            .unwrap();
         dc.commit(None, None).unwrap();
-        let b = dc.upsert((10..20).map(|i| (vecf(8, i), None)).collect()).unwrap();
+        let b = dc
+            .upsert((10..20).map(|i| (vecf(8, i), None)).collect())
+            .unwrap();
         dc.commit(None, None).unwrap();
         assert_eq!(dc.collection().sealed_count(), 2);
 
@@ -929,7 +941,10 @@ mod tests {
         assert_eq!(dc.collection().sealed_count(), 1);
         assert_eq!(dc.len(), 15, "compaction must not change the live count");
         for &id in &gone {
-            assert!(dc.get_point(id).is_none(), "deleted id {id} resurrected by compaction");
+            assert!(
+                dc.get_point(id).is_none(),
+                "deleted id {id} resurrected by compaction"
+            );
         }
         let res = dc.search(&vecf(8, 0), 20, None).unwrap();
         for &id in &gone {
@@ -968,9 +983,17 @@ mod tests {
 
         // Two more upserts cross 10 cumulative upserts -> auto-commit fires once.
         let cross = dc
-            .write_batch((100..102).map(|i| (vecf(8, i), None)).collect(), vec![], None)
+            .write_batch(
+                (100..102).map(|i| (vecf(8, i), None)).collect(),
+                vec![],
+                None,
+            )
             .unwrap();
-        assert_eq!(cross.version, Some(0), "auto-commit should fire at the threshold");
+        assert_eq!(
+            cross.version,
+            Some(0),
+            "auto-commit should fire at the threshold"
+        );
         assert_eq!(dc.list_versions().len(), 1);
         assert_eq!(dc.list_versions()[0].trigger, "auto");
     }
@@ -996,8 +1019,13 @@ mod tests {
         }
         let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
         assert_eq!(dc.len(), 1);
-        assert!(dc.get_point(deleted).is_none(), "tombstone must survive checkpoint");
-        let rec = dc.get_point(kept).expect("kept point present after checkpoint+reopen");
+        assert!(
+            dc.get_point(deleted).is_none(),
+            "tombstone must survive checkpoint"
+        );
+        let rec = dc
+            .get_point(kept)
+            .expect("kept point present after checkpoint+reopen");
         let pl = rec.payload.expect("payload must survive checkpoint");
         assert!(serde_json::to_string(&pl).unwrap().contains("keep"));
     }
@@ -1008,11 +1036,14 @@ mod tests {
         let cfg = CollectionConfig::new("c", 8, Metric::Dot);
         {
             let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
-            dc.upsert((0..10).map(|i| (vecf(8, i), None)).collect()).unwrap();
+            dc.upsert((0..10).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
             dc.checkpoint().unwrap(); // gen 0 -> 1
-            dc.upsert((10..20).map(|i| (vecf(8, i), None)).collect()).unwrap();
+            dc.upsert((10..20).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
             dc.checkpoint().unwrap(); // gen 1 -> 2
-            dc.upsert((20..25).map(|i| (vecf(8, i), None)).collect()).unwrap();
+            dc.upsert((20..25).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
         }
         // Only the latest WAL generation file may remain; older ones are retired.
         let wals: Vec<String> = std::fs::read_dir(dir.path())
@@ -1020,7 +1051,11 @@ mod tests {
             .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
             .filter(|n| n.starts_with("wal.") && n.ends_with(".log"))
             .collect();
-        assert_eq!(wals, vec!["wal.2.log".to_string()], "old WAL generations not retired: {wals:?}");
+        assert_eq!(
+            wals,
+            vec!["wal.2.log".to_string()],
+            "old WAL generations not retired: {wals:?}"
+        );
         let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
         assert_eq!(dc.len(), 25); // 10 + 10 sealed + 5 replayed from the active WAL
     }
@@ -1033,7 +1068,8 @@ mod tests {
         let cfg = CollectionConfig::new("c", 8, Metric::Dot);
         {
             let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Async).unwrap();
-            dc.upsert((0..15).map(|i| (vecf(8, i), None)).collect()).unwrap();
+            dc.upsert((0..15).map(|i| (vecf(8, i), None)).collect())
+                .unwrap();
             dc.commit(None, None).unwrap();
             assert_eq!(dc.len(), 15);
         }

@@ -489,8 +489,7 @@ mod tests {
         }
         let entry = g.entry.expect("non-empty graph must have an entry");
         assert_eq!(
-            g.levels[entry as usize] as usize,
-            g.max_level,
+            g.levels[entry as usize] as usize, g.max_level,
             "entry must sit at the top level"
         );
         for p in 0..n as u32 {
@@ -595,11 +594,16 @@ mod tests {
             for q in 0..queries {
                 let query = vec_of(dim, 200_000 + q);
                 let truth = brute_force_topk(&store, &kernel, &query, 10, None, None);
-                seq_total += recall_at(&seq.search(&query, 10, SearchParams::default(), None), &truth);
-                par_total += recall_at(&par.search(&query, 10, SearchParams::default(), None), &truth);
+                seq_total += recall_at(
+                    &seq.search(&query, 10, SearchParams::default(), None),
+                    &truth,
+                );
+                par_total += recall_at(
+                    &par.search(&query, 10, SearchParams::default(), None),
+                    &truth,
+                );
             }
-            let (seq_recall, par_recall) =
-                (seq_total / queries as f32, par_total / queries as f32);
+            let (seq_recall, par_recall) = (seq_total / queries as f32, par_total / queries as f32);
             assert!(
                 par_recall >= seq_recall - 0.05,
                 "metric={metric}: parallel recall {par_recall:.3} materially below sequential {seq_recall:.3}"
@@ -644,7 +648,10 @@ mod tests {
                 total += recall_at(&got, truth);
             }
             let recall = total / queries.len() as f32;
-            assert!(recall >= 0.90, "run {run}: concurrent-build recall {recall:.3} < 0.90");
+            assert!(
+                recall >= 0.90,
+                "run {run}: concurrent-build recall {recall:.3} < 0.90"
+            );
         }
     }
 
@@ -673,9 +680,14 @@ mod tests {
             for q in 0..queries {
                 let query = vec_of(dim, 300_000 + q);
                 let truth = brute_force_topk(&store, &kernel, &query, 10, None, None);
-                f32_total += recall_at(&f32_idx.search(&query, 10, SearchParams::default(), None), &truth);
-                int8_total +=
-                    recall_at(&int8_idx.search(&query, 10, SearchParams::default(), None), &truth);
+                f32_total += recall_at(
+                    &f32_idx.search(&query, 10, SearchParams::default(), None),
+                    &truth,
+                );
+                int8_total += recall_at(
+                    &int8_idx.search(&query, 10, SearchParams::default(), None),
+                    &truth,
+                );
             }
             let (f32_recall, int8_recall) =
                 (f32_total / queries as f32, int8_total / queries as f32);

@@ -159,7 +159,9 @@ mod tests {
     fn build_sealed(quantization: bool) -> SealedSegment {
         let mut seg = AppendableSegment::new(8, Metric::Cosine);
         for i in 0..16u64 {
-            let v: Vec<f32> = (0..8).map(|j| ((i * 7 + j * 3) % 13) as f32 + 0.5).collect();
+            let v: Vec<f32> = (0..8)
+                .map(|j| ((i * 7 + j * 3) % 13) as f32 + 0.5)
+                .collect();
             seg.append(GlobalId::new(i), &v);
         }
         let cfg = HnswConfig {

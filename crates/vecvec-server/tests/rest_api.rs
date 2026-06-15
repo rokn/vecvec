@@ -81,10 +81,21 @@ async fn rest_routes_coverage() {
     let router = rest::router(service);
     let dim = 8;
 
-    let (s, _) = post(router.clone(), "/collections/c", r#"{"dim":8,"metric":"dot"}"#.into()).await;
+    let (s, _) = post(
+        router.clone(),
+        "/collections/c",
+        r#"{"dim":8,"metric":"dot"}"#.into(),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     let points: Vec<String> = (0..12u32)
-        .map(|i| format!(r#"{{"vector":{:?},"payload":{{"g":{}}}}}"#, vec_of(dim, i + 1), i % 3))
+        .map(|i| {
+            format!(
+                r#"{{"vector":{:?},"payload":{{"g":{}}}}}"#,
+                vec_of(dim, i + 1),
+                i % 3
+            )
+        })
         .collect();
     let (s, j) = post(
         router.clone(),
@@ -143,16 +154,37 @@ async fn rest_routes_coverage() {
     // diff v0 -> v1 shows id 0 removed
     let (s, j) = get(router.clone(), "/collections/c/diff?from=0&to=1").await;
     assert_eq!(s, StatusCode::OK);
-    assert!(j["removed"].as_array().unwrap().iter().any(|v| v.as_u64() == Some(0)));
+    assert!(
+        j["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_u64() == Some(0))
+    );
 
     // tag + branch over v0
-    let (s, _) = post(router.clone(), "/collections/c/tags", r#"{"name":"rel","version":0}"#.into()).await;
+    let (s, _) = post(
+        router.clone(),
+        "/collections/c/tags",
+        r#"{"name":"rel","version":0}"#.into(),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
-    let (s, _) = post(router.clone(), "/collections/c/branches", r#"{"name":"b","version":0}"#.into()).await;
+    let (s, _) = post(
+        router.clone(),
+        "/collections/c/branches",
+        r#"{"name":"b","version":0}"#.into(),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
 
     // restore v0 (brings point 0 back); returns a new version
-    let (s, j) = post(router.clone(), "/collections/c/restore", r#"{"version":0}"#.into()).await;
+    let (s, j) = post(
+        router.clone(),
+        "/collections/c/restore",
+        r#"{"version":0}"#.into(),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     assert!(j["version"].as_u64().unwrap() >= 2);
     let (s, _) = get(router.clone(), "/collections/c/points/0").await;
@@ -164,7 +196,10 @@ async fn rest_routes_coverage() {
     let (s, j) = del(router.clone(), "/collections/c").await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(j["dropped"], "c");
-    assert!(!coll_dir.exists(), "drop_collection must delete on-disk data");
+    assert!(
+        !coll_dir.exists(),
+        "drop_collection must delete on-disk data"
+    );
     let (s, _) = get(router.clone(), "/collections/c").await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }

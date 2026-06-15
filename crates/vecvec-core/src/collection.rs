@@ -482,12 +482,11 @@ impl Collection {
             Some(selector) => {
                 let (segment_ids, deletions) = {
                     let versions = self.versions.lock();
-                    let version =
-                        versions
-                            .resolve(selector)
-                            .ok_or_else(|| CoreError::Version {
-                                detail: format!("unresolved selector {selector:?}"),
-                            })?;
+                    let version = versions
+                        .resolve(selector)
+                        .ok_or_else(|| CoreError::Version {
+                            detail: format!("unresolved selector {selector:?}"),
+                        })?;
                     let manifest = versions.get(version).expect("resolved version exists");
                     (
                         manifest.segments.iter().map(|s| s.id).collect::<Vec<u64>>(),

@@ -293,7 +293,15 @@ mod tests {
     #[test]
     fn batch_command_parses_delete_csv_and_flags() {
         let cli = Cli::try_parse_from([
-            "vecvec", "batch", "--collection", "c", "--delete", "1,2,3", "--commit", "--tag", "v1",
+            "vecvec",
+            "batch",
+            "--collection",
+            "c",
+            "--delete",
+            "1,2,3",
+            "--commit",
+            "--tag",
+            "v1",
         ])
         .expect("batch args should parse");
         match cli.command {
