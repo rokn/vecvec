@@ -10,6 +10,7 @@ result-*
 # Local server data directories
 /data
 *.vecvec-data
+vecvec-data
 
 # Editor/OS cruft
 .DS_Store
