@@ -85,6 +85,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn respects_max_inflight_backpressure() {
+        // The semaphore caps concurrently-running closures at max_inflight even when
+        // the rayon pool has more threads. Track live concurrency from inside the
+        // closures; the observed peak must never exceed the cap.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let bridge = Arc::new(BlockingBridge::new(8, 2)); // 8 threads, cap 2 in flight
+        let cur = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..24 {
+            let bridge = bridge.clone();
+            let cur = cur.clone();
+            let peak = peak.clone();
+            handles.push(tokio::spawn(async move {
+                bridge
+                    .run(move || {
+                        let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        cur.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(observed >= 1);
+        assert!(observed <= 2, "peak in-flight {observed} exceeded max_inflight=2");
+    }
+
+    #[tokio::test]
     async fn contains_panics() {
         let bridge = BlockingBridge::new(2, 4);
         let err = bridge

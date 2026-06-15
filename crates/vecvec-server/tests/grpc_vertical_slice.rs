@@ -142,6 +142,126 @@ async fn create_upsert_query_over_grpc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_batch_over_grpc() {
+    let dim = 8usize;
+    let data = tempfile::tempdir().unwrap();
+    let service = Arc::new(Service::open(data.path(), 2, 8, FsyncMode::Sync).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { serve(service, listener).await });
+    let channel = connect(addr).await;
+
+    let mut collections = pb::collections_client::CollectionsClient::new(channel.clone());
+    collections
+        .create(pb::CreateCollectionRequest {
+            name: "c".into(),
+            dim: dim as u32,
+            metric: pb::Metric::Dot as i32,
+        })
+        .await
+        .unwrap();
+
+    let mut points = pb::points_client::PointsClient::new(channel.clone());
+    // Seed 4 points (ids 0..3) via streaming upsert.
+    let seed = points
+        .upsert(tokio_stream::iter(vec![pb::UpsertRequest {
+            collection: "c".into(),
+            vectors: (0..4)
+                .map(|i| pb::Vector {
+                    values: vec_of(dim, i as u32 + 1),
+                    payload: None,
+                })
+                .collect(),
+        }]))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(seed.ids, vec![0, 1, 2, 3]);
+
+    // Atomic mixed batch: delete 0,1 + upsert 3 new + commit a version.
+    let resp = points
+        .write_batch(pb::WriteBatchRequest {
+            collection: "c".into(),
+            upserts: (0..3)
+                .map(|i| pb::Vector {
+                    values: vec_of(dim, 100 + i as u32),
+                    payload: Some("{\"k\":1}".into()),
+                })
+                .collect(),
+            deletes: vec![0, 1],
+            commit: true,
+            message: Some("tx".into()),
+            tag: Some("v1".into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.ids, vec![4, 5, 6]);
+    assert_eq!(resp.deleted, 2);
+    assert_eq!(resp.version, Some(0));
+
+    // The commit is visible over the versioning surface.
+    let mut versioning = pb::versioning_client::VersioningClient::new(channel.clone());
+    let versions = versioning
+        .list_versions(pb::ListVersionsRequest {
+            collection: "c".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(versions.versions.len(), 1);
+
+    // No-commit batch: re-deleting an already-gone id counts 0, no version.
+    let resp2 = points
+        .write_batch(pb::WriteBatchRequest {
+            collection: "c".into(),
+            upserts: vec![],
+            deletes: vec![0, 999],
+            commit: false,
+            message: None,
+            tag: None,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp2.deleted, 0);
+    assert_eq!(resp2.version, None);
+
+    // Validation: empty collection -> InvalidArgument.
+    let err = points
+        .write_batch(pb::WriteBatchRequest {
+            collection: String::new(),
+            upserts: vec![],
+            deletes: vec![],
+            commit: false,
+            message: None,
+            tag: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // Validation: malformed payload JSON -> InvalidArgument.
+    let err2 = points
+        .write_batch(pb::WriteBatchRequest {
+            collection: "c".into(),
+            upserts: vec![pb::Vector {
+                values: vec_of(dim, 1),
+                payload: Some("{not json".into()),
+            }],
+            deletes: vec![],
+            commit: false,
+            message: None,
+            tag: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err2.code(), tonic::Code::InvalidArgument);
+
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_map_to_grpc_status_codes() {
     let data = tempfile::tempdir().unwrap();
     let service = Arc::new(Service::open(data.path(), 2, 8, FsyncMode::Sync).unwrap());

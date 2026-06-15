@@ -795,6 +795,47 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_write_batches_serialize_cleanly() {
+        // The WAL lock serializes write_batch, and an explicit commit runs under that
+        // same lock. Under heavy concurrency this must hold: no upsert lost or
+        // duplicated (atomic ids), and each committing batch yields exactly one
+        // version (commit boundary == that batch, never interleaved/merged/dropped).
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        let dc = Arc::new(DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap());
+
+        let threads = 4usize;
+        let batches = 10usize;
+        let per_batch = 5usize;
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let dc = Arc::clone(&dc);
+                scope.spawn(move || {
+                    for b in 0..batches {
+                        let upserts = (0..per_batch)
+                            .map(|i| (vecf(8, t * 1000 + b * 10 + i), None))
+                            .collect::<Vec<_>>();
+                        let out = dc
+                            .write_batch(upserts, Vec::new(), Some((Some(format!("t{t}b{b}")), None)))
+                            .unwrap();
+                        assert_eq!(out.ids.len(), per_batch);
+                        assert!(out.version.is_some());
+                    }
+                });
+            }
+        });
+
+        let total = threads * batches * per_batch;
+        assert_eq!(dc.len(), total, "upserts lost or duplicated under concurrency");
+        assert_eq!(
+            dc.list_versions().len(),
+            threads * batches,
+            "each committing batch must produce exactly one version"
+        );
+    }
+
+    #[test]
     fn compaction_trigger_segment_count_and_time() {
         use std::sync::atomic::{AtomicU64, Ordering};
         struct ManualClock(AtomicU64);
@@ -862,6 +903,143 @@ mod tests {
         // Below threshold now → no-op.
         assert!(dc.maybe_compact().unwrap().is_none());
         assert_eq!(dc.collection().sealed_count(), 1);
+    }
+
+    #[test]
+    fn compaction_with_deletes_does_not_resurrect_tombstones() {
+        // compact() rebuilds a merged segment by carrying ALL rows (iter_points has no
+        // deletion filter) and keeps the working deletion vector. Tombstoned points
+        // must therefore stay tombstoned through the rebuild — and across a reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
+        let a = dc.upsert((0..10).map(|i| (vecf(8, i), None)).collect()).unwrap();
+        dc.commit(None, None).unwrap();
+        let b = dc.upsert((10..20).map(|i| (vecf(8, i), None)).collect()).unwrap();
+        dc.commit(None, None).unwrap();
+        assert_eq!(dc.collection().sealed_count(), 2);
+
+        let gone = [a[0], a[1], b[0], b[1], b[2]];
+        for &id in &gone {
+            assert!(dc.delete(id).unwrap());
+        }
+        assert_eq!(dc.len(), 15);
+
+        assert!(dc.compact().unwrap().is_some());
+        assert_eq!(dc.collection().sealed_count(), 1);
+        assert_eq!(dc.len(), 15, "compaction must not change the live count");
+        for &id in &gone {
+            assert!(dc.get_point(id).is_none(), "deleted id {id} resurrected by compaction");
+        }
+        let res = dc.search(&vecf(8, 0), 20, None).unwrap();
+        for &id in &gone {
+            assert!(
+                res.iter().all(|s| s.id.get() != id),
+                "deleted id {id} returned by search after compaction"
+            );
+        }
+        drop(dc);
+        let dc2 = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+        assert_eq!(dc2.len(), 15, "tombstones must survive compaction + reopen");
+    }
+
+    #[test]
+    fn write_batch_auto_commits_on_threshold_excluding_deletes() {
+        // Drives the policy auto-commit path through write_batch and pins the
+        // documented contract that deletes do NOT advance the write trigger.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        cfg.versioning = crate::version::VersioningPolicy::every_n_writes(10);
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+
+        // 9 upserts: below threshold, no commit.
+        let first = dc
+            .write_batch((0..9).map(|i| (vecf(8, i), None)).collect(), vec![], None)
+            .unwrap();
+        assert_eq!(first.version, None);
+        assert_eq!(dc.list_versions().len(), 0);
+
+        // Delete-only batch must not advance the trigger.
+        let del = dc
+            .write_batch(vec![], vec![first.ids[0], first.ids[1]], None)
+            .unwrap();
+        assert_eq!(del.version, None, "deletes must not trigger auto-commit");
+        assert_eq!(dc.list_versions().len(), 0);
+
+        // Two more upserts cross 10 cumulative upserts -> auto-commit fires once.
+        let cross = dc
+            .write_batch((100..102).map(|i| (vecf(8, i), None)).collect(), vec![], None)
+            .unwrap();
+        assert_eq!(cross.version, Some(0), "auto-commit should fire at the threshold");
+        assert_eq!(dc.list_versions().len(), 1);
+        assert_eq!(dc.list_versions()[0].trigger, "auto");
+    }
+
+    #[test]
+    fn checkpoint_persists_deletions_and_payloads() {
+        // The HEAD checkpoint must carry the live deletion vector + payload map so a
+        // reopen restores them (not just the segments).
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        let (kept, deleted);
+        {
+            let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
+            let payload: crate::payload::Payload =
+                serde_json::from_str(r#"{"label":"keep"}"#).unwrap();
+            let ids = dc
+                .upsert(vec![(vecf(8, 0), Some(payload)), (vecf(8, 1), None)])
+                .unwrap();
+            kept = ids[0];
+            deleted = ids[1];
+            assert!(dc.delete(deleted).unwrap());
+            dc.checkpoint().unwrap(); // folds WAL; HEAD must capture deletions + payloads
+        }
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+        assert_eq!(dc.len(), 1);
+        assert!(dc.get_point(deleted).is_none(), "tombstone must survive checkpoint");
+        let rec = dc.get_point(kept).expect("kept point present after checkpoint+reopen");
+        let pl = rec.payload.expect("payload must survive checkpoint");
+        assert!(serde_json::to_string(&pl).unwrap().contains("keep"));
+    }
+
+    #[test]
+    fn multi_generation_wal_recovers_and_retires_old_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        {
+            let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Sync).unwrap();
+            dc.upsert((0..10).map(|i| (vecf(8, i), None)).collect()).unwrap();
+            dc.checkpoint().unwrap(); // gen 0 -> 1
+            dc.upsert((10..20).map(|i| (vecf(8, i), None)).collect()).unwrap();
+            dc.checkpoint().unwrap(); // gen 1 -> 2
+            dc.upsert((20..25).map(|i| (vecf(8, i), None)).collect()).unwrap();
+        }
+        // Only the latest WAL generation file may remain; older ones are retired.
+        let wals: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.starts_with("wal.") && n.ends_with(".log"))
+            .collect();
+        assert_eq!(wals, vec!["wal.2.log".to_string()], "old WAL generations not retired: {wals:?}");
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Sync).unwrap();
+        assert_eq!(dc.len(), 25); // 10 + 10 sealed + 5 replayed from the active WAL
+    }
+
+    #[test]
+    fn async_fsync_mode_recovers_on_clean_reopen() {
+        // FsyncMode::Async skips fsync but still writes to the OS; a clean process
+        // exit flushes, so a reopen in the same session recovers all acked writes.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig::new("c", 8, Metric::Dot);
+        {
+            let dc = DurableCollection::open(dir.path(), cfg.clone(), FsyncMode::Async).unwrap();
+            dc.upsert((0..15).map(|i| (vecf(8, i), None)).collect()).unwrap();
+            dc.commit(None, None).unwrap();
+            assert_eq!(dc.len(), 15);
+        }
+        let dc = DurableCollection::open(dir.path(), cfg, FsyncMode::Async).unwrap();
+        assert_eq!(dc.len(), 15);
+        assert_eq!(dc.list_versions().len(), 1);
     }
 
     proptest::proptest! {

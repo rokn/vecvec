@@ -109,6 +109,12 @@ enum Command {
 /// Parses a JSONL file of `{"vector":[...],"payload":{...}}` lines into wire vectors.
 fn parse_vectors_jsonl(path: &std::path::Path) -> Result<Vec<pb::Vector>, BoxError> {
     let text = std::fs::read_to_string(path)?;
+    parse_vectors_jsonl_str(&text)
+}
+
+/// Parses JSONL text (one `{"vector":[...],"payload":{...}}` per line; blank lines
+/// skipped) into wire vectors. Split out from file IO so it is unit-testable.
+fn parse_vectors_jsonl_str(text: &str) -> Result<Vec<pb::Vector>, BoxError> {
     let mut vectors = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let v: serde_json::Value = serde_json::from_str(line)?;
@@ -278,4 +284,53 @@ async fn main() -> Result<(), BoxError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_command_parses_delete_csv_and_flags() {
+        let cli = Cli::try_parse_from([
+            "vecvec", "batch", "--collection", "c", "--delete", "1,2,3", "--commit", "--tag", "v1",
+        ])
+        .expect("batch args should parse");
+        match cli.command {
+            Command::Batch {
+                collection,
+                file,
+                delete,
+                commit,
+                message,
+                tag,
+                ..
+            } => {
+                assert_eq!(collection, "c");
+                assert_eq!(delete, vec![1, 2, 3]); // value_delimiter splits the CSV
+                assert!(file.is_none()); // --file is optional
+                assert!(commit);
+                assert_eq!(tag.as_deref(), Some("v1"));
+                assert!(message.is_none());
+            }
+            _ => panic!("expected a Batch command"),
+        }
+    }
+
+    #[test]
+    fn jsonl_parses_and_reports_errors() {
+        let v = parse_vectors_jsonl_str(
+            "{\"vector\":[1,2],\"payload\":{\"k\":1}}\n\n{\"vector\":[3,4]}\n",
+        )
+        .unwrap();
+        assert_eq!(v.len(), 2); // blank line skipped
+        assert_eq!(v[0].values, vec![1.0, 2.0]);
+        assert!(v[0].payload.is_some());
+        assert!(v[1].payload.is_none());
+
+        // missing 'vector' field is an error
+        assert!(parse_vectors_jsonl_str("{\"payload\":{}}").is_err());
+        // malformed JSON is an error
+        assert!(parse_vectors_jsonl_str("{not json").is_err());
+    }
 }

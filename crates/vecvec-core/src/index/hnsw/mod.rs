@@ -386,6 +386,53 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_searches_match_serial_baseline() {
+        // VisitedPool hands a reused VisitedList to each search; a clear()/generation
+        // bug or a leaked list would corrupt a concurrent query's traversal. Proof:
+        // every result from many threads hammering one shared index must exactly
+        // equal its single-threaded baseline (search is deterministic per query).
+        let dim = 24;
+        let n = 1_500;
+        let store = storage(dim, n, Metric::Cosine);
+        let index = HnswIndex::build(store, HnswConfig::default());
+
+        let queries: Vec<Vec<f32>> = (0..64).map(|q| vec_of(dim, 200_000 + q)).collect();
+        let baseline: Vec<Vec<(u32, f32)>> = queries
+            .iter()
+            .map(|q| {
+                index
+                    .search(q, 10, SearchParams::default(), None)
+                    .into_iter()
+                    .map(|s| (s.id.get(), s.score))
+                    .collect()
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let index = &index;
+                let queries = &queries;
+                let baseline = &baseline;
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        for (qi, q) in queries.iter().enumerate() {
+                            let got: Vec<(u32, f32)> = index
+                                .search(q, 10, SearchParams::default(), None)
+                                .into_iter()
+                                .map(|s| (s.id.get(), s.score))
+                                .collect();
+                            assert_eq!(
+                                got, baseline[qi],
+                                "concurrent search diverged from serial baseline for query {qi}"
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
     fn deleted_points_are_never_returned() {
         let dim = 16;
         let n = 800;
@@ -562,6 +609,41 @@ mod tests {
                     "metric={metric}: parallel recall@10 {par_recall:.3} < 0.95"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn concurrent_build_is_stable_across_repeats() {
+        // The concurrent builder merges own-links and pushes reverse-links under
+        // per-node locks. A lost-update / overwrite-instead-of-merge race would
+        // surface non-deterministically as a dropped node or a recall dip on some
+        // runs. Repeat the multi-threaded build many times; every run must keep all
+        // nodes and stay above the recall floor.
+        let dim = 24;
+        let n = 1_200;
+        let store = storage(dim, n, Metric::Cosine);
+        let kernel = DistanceKernel::new(Metric::Cosine, dim);
+        let queries: Vec<Vec<f32>> = (0..20).map(|q| vec_of(dim, 300_000 + q)).collect();
+        let truths: Vec<Vec<ScoredPoint>> = queries
+            .iter()
+            .map(|q| brute_force_topk(&store, &kernel, q, 10, None, None))
+            .collect();
+
+        for run in 0..16 {
+            let index = HnswIndex::build_concurrent(store.clone(), HnswConfig::default());
+            assert_eq!(
+                index.graph().levels.len(),
+                n,
+                "run {run}: a node was lost during concurrent build"
+            );
+            let mut total = 0.0f32;
+            for (q, truth) in queries.iter().zip(&truths) {
+                let got = index.search(q, 10, SearchParams::default(), None);
+                assert_eq!(got.len(), 10);
+                total += recall_at(&got, truth);
+            }
+            let recall = total / queries.len() as f32;
+            assert!(recall >= 0.90, "run {run}: concurrent-build recall {recall:.3} < 0.90");
         }
     }
 

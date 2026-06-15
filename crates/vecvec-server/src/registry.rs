@@ -65,3 +65,40 @@ impl Registry {
         self.collections.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vecvec_core::{CollectionConfig, FsyncMode, Metric};
+
+    fn dc(dir: &std::path::Path) -> Arc<DurableCollection> {
+        let cfg = CollectionConfig::new("c", 4, Metric::Dot);
+        Arc::new(DurableCollection::open(dir, cfg, FsyncMode::Async).unwrap())
+    }
+
+    #[test]
+    fn insert_collision_get_remove_and_listing() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        let r = Registry::new();
+        assert!(r.is_empty());
+
+        assert!(r.insert_new("a".into(), dc(d1.path())));
+        // Same name is rejected (not overwritten).
+        assert!(!r.insert_new("a".into(), dc(d2.path())));
+        assert!(r.insert_new("b".into(), dc(d2.path())));
+        assert_eq!(r.len(), 2);
+
+        assert!(r.get("a").is_some());
+        assert!(r.get("missing").is_none());
+
+        let mut names: Vec<String> = r.list_all().into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        assert_eq!(names, vec!["a", "b"]);
+        assert_eq!(r.snapshot().len(), 2);
+
+        assert!(r.remove("a").is_some());
+        assert!(r.remove("a").is_none()); // already gone
+        assert_eq!(r.len(), 1);
+    }
+}

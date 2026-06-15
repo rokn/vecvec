@@ -108,6 +108,78 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_disjoint_deletes_lose_nothing() {
+        // The raison d'être of SoftDeleteSet is lock-free concurrent deletes via
+        // ArcSwap::rcu. N threads each tombstone a disjoint range; none may be lost.
+        let s = SoftDeleteSet::new();
+        let threads = 8u32;
+        let per = 500u32;
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let s = &s;
+                scope.spawn(move || {
+                    for i in 0..per {
+                        s.delete(PointId::new(t * per + i));
+                    }
+                });
+            }
+        });
+        assert_eq!(s.deleted_count(), (threads * per) as usize);
+        for id in 0..threads * per {
+            assert!(s.is_deleted(PointId::new(id)), "id {id} lost");
+        }
+    }
+
+    #[test]
+    fn concurrent_overlapping_deletes_report_newly_exactly_once() {
+        // Under contention every id must transition undeleted->deleted exactly once
+        // across all threads — a broken rcu CAS would double-count or lose a delete.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let s = SoftDeleteSet::new();
+        let newly = AtomicUsize::new(0);
+        let range = 1000u32;
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let s = &s;
+                let newly = &newly;
+                scope.spawn(move || {
+                    for i in 0..range {
+                        if s.delete(PointId::new(i)) {
+                            newly.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(s.deleted_count(), range as usize);
+        assert_eq!(newly.load(Ordering::Relaxed), range as usize);
+    }
+
+    #[test]
+    fn snapshot_stable_while_writers_publish() {
+        let s = SoftDeleteSet::new();
+        for i in 0..100u32 {
+            s.delete(PointId::new(i));
+        }
+        let snap = s.snapshot();
+        std::thread::scope(|scope| {
+            for t in 0..4u32 {
+                let s = &s;
+                scope.spawn(move || {
+                    for i in 0..100u32 {
+                        s.delete(PointId::new(1000 + t * 100 + i));
+                    }
+                });
+            }
+        });
+        // The pre-spawn snapshot is frozen: unaffected by concurrent publishes.
+        assert_eq!(snap.len(), 100);
+        assert!(snap.iter().all(|x| x < 100));
+        // The live set saw every concurrent delete.
+        assert_eq!(s.deleted_count(), 100 + 4 * 100);
+    }
+
+    #[test]
     fn rebuild_threshold_crossing() {
         // 30% is the trigger.
         assert!(!should_rebuild(29, 100));

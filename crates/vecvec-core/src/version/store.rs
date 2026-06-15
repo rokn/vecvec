@@ -337,3 +337,157 @@ pub enum VersionError {
     #[error("could not resolve version selector")]
     Unresolvable,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::GlobalId;
+
+    fn seg(id: u64, lo: u64, hi: u64) -> SegmentRef {
+        SegmentRef {
+            id,
+            id_lo: lo,
+            id_hi: hi,
+            count: hi - lo + 1,
+        }
+    }
+
+    fn dv(deleted: &[u64]) -> DeletionVector {
+        let mut d = DeletionVector::default();
+        for &id in deleted {
+            d.insert(GlobalId::new(id));
+        }
+        d
+    }
+
+    fn commit(s: &mut VersionStore, segs: Vec<SegmentRef>, deleted: &[u64]) -> u64 {
+        s.commit("test", None, None, segs, dv(deleted), 0).version
+    }
+
+    #[test]
+    fn commit_links_parent_advances_head_and_next_version() {
+        let mut s = VersionStore::new();
+        assert_eq!(s.head(), None);
+        let m0 = s.commit("manual", None, None, vec![seg(0, 0, 9)], dv(&[]), 0);
+        assert_eq!(m0.version, 0);
+        assert_eq!(m0.parent, None);
+        assert_eq!(s.head(), Some(0));
+        let m1 = s.commit("manual", None, None, vec![seg(1, 10, 19)], dv(&[]), 0);
+        assert_eq!(m1.version, 1);
+        assert_eq!(m1.parent, Some(0)); // parent-linked to previous head
+        assert_eq!(s.head(), Some(1));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn resolve_covers_version_tag_branch_and_head() {
+        let mut s = VersionStore::new();
+        assert_eq!(s.resolve(&VersionSelector::Head), None); // empty store
+        let v0 = commit(&mut s, vec![seg(0, 0, 9)], &[]);
+        let v1 = commit(&mut s, vec![seg(1, 10, 19)], &[]);
+        s.set_tag("rel", v0).unwrap();
+        s.set_branch("dev", v0).unwrap();
+        assert_eq!(s.resolve(&VersionSelector::Version(v0)), Some(v0));
+        assert_eq!(s.resolve(&VersionSelector::Version(999)), None);
+        assert_eq!(s.resolve(&VersionSelector::Tag("rel".into())), Some(v0));
+        assert_eq!(s.resolve(&VersionSelector::Tag("nope".into())), None);
+        assert_eq!(s.resolve(&VersionSelector::Branch("dev".into())), Some(v0));
+        assert_eq!(s.resolve(&VersionSelector::Branch("nope".into())), None);
+        assert_eq!(s.resolve(&VersionSelector::Head), Some(v1)); // head == last commit
+    }
+
+    #[test]
+    fn set_tag_branch_and_diff_reject_unknown_version() {
+        let mut s = VersionStore::new();
+        commit(&mut s, vec![seg(0, 0, 9)], &[]);
+        assert!(matches!(s.set_tag("t", 999), Err(VersionError::NoSuchVersion(999))));
+        assert!(matches!(s.set_branch("b", 999), Err(VersionError::NoSuchVersion(999))));
+        assert!(matches!(s.diff(0, 999), Err(VersionError::NoSuchVersion(999))));
+        assert!(matches!(s.diff(999, 0), Err(VersionError::NoSuchVersion(999))));
+    }
+
+    #[test]
+    fn moving_tag_and_branch_repoints_without_duplicating() {
+        let mut s = VersionStore::new();
+        let v0 = commit(&mut s, vec![seg(0, 0, 9)], &[]);
+        let v1 = commit(&mut s, vec![seg(1, 10, 19)], &[]);
+        s.set_branch("main", v0).unwrap();
+        assert_eq!(s.resolve(&VersionSelector::Branch("main".into())), Some(v0));
+        s.set_branch("main", v1).unwrap(); // move, not create
+        assert_eq!(s.resolve(&VersionSelector::Branch("main".into())), Some(v1));
+        assert_eq!(s.branches().len(), 1);
+        s.set_tag("t", v0).unwrap();
+        s.set_tag("t", v1).unwrap();
+        assert_eq!(s.resolve(&VersionSelector::Tag("t".into())), Some(v1));
+        assert_eq!(s.tags().len(), 1);
+    }
+
+    #[test]
+    fn gc_retention_guards_protect_tagged_and_branch_head_versions() {
+        // The data-loss safety property: a tagged or branch-pointed version older than
+        // the keep_last window MUST survive GC, and its segments must NOT be orphaned.
+        let mut s = VersionStore::new();
+        let v0 = commit(&mut s, vec![seg(0, 0, 9)], &[]);
+        let v1 = commit(&mut s, vec![seg(1, 10, 19)], &[]);
+        let v2 = commit(&mut s, vec![seg(2, 20, 29)], &[]); // head
+        s.set_tag("release", v0).unwrap();
+        s.set_branch("b", v1).unwrap();
+
+        // keep_last=1 alone would drop v0 and v1 — the tag/branch/head guards save them.
+        let guarded = RetentionRules {
+            keep_last: Some(1),
+            keep_tagged: true,
+            keep_branch_heads: true,
+        };
+        let r = s.plan_gc(&guarded);
+        assert!(r.removed_versions.is_empty(), "tag/branch/head must protect v0,v1,v2");
+        assert!(r.orphan_segments.is_empty());
+
+        // Disable the guards: v0 (tag) and v1 (branch) drop; v2 stays (head + keep_last).
+        let unguarded = RetentionRules {
+            keep_last: Some(1),
+            keep_tagged: false,
+            keep_branch_heads: false,
+        };
+        let r2 = s.plan_gc(&unguarded);
+        assert_eq!(r2.removed_versions, vec![v0, v1]);
+        assert_eq!(r2.orphan_segments, vec![0, 1]); // their now-unreferenced segments
+        let _ = v2;
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_tags_branches_head_next_version() {
+        let mut s = VersionStore::new();
+        let v0 = s
+            .commit("m", Some("first".into()), Some("autotag".into()), vec![seg(0, 0, 9)], dv(&[]), 0)
+            .version;
+        let v1 = commit(&mut s, vec![seg(1, 10, 19)], &[]);
+        s.set_branch("dev", v0).unwrap();
+        s.set_tag("rel", v1).unwrap();
+
+        // Round-trip through the real serde path (catches field drift / missing maps).
+        let bytes = rmp_serde::to_vec(&s.snapshot()).unwrap();
+        let snap2: VersionStoreSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let mut s2 = VersionStore::from_snapshot(snap2);
+
+        assert_eq!(s2.len(), 2);
+        assert_eq!(s2.head(), Some(v1));
+        assert_eq!(s2.resolve(&VersionSelector::Branch("dev".into())), Some(v0));
+        assert_eq!(s2.resolve(&VersionSelector::Tag("rel".into())), Some(v1));
+        assert_eq!(s2.resolve(&VersionSelector::Tag("autotag".into())), Some(v0));
+        // next_version restored: a new commit must not reuse an existing id.
+        let v2 = commit(&mut s2, vec![seg(2, 20, 29)], &[]);
+        assert_eq!(v2, 2);
+    }
+
+    #[test]
+    fn diff_reports_added_and_removed_accounting_for_deletions() {
+        let mut s = VersionStore::new();
+        let v0 = commit(&mut s, vec![seg(0, 0, 4)], &[]); // live {0,1,2,3,4}
+        // v1: same range with 2 deleted, plus a new segment for 5,6.
+        let v1 = commit(&mut s, vec![seg(0, 0, 4), seg(1, 5, 6)], &[2]); // live {0,1,3,4,5,6}
+        let d = s.diff(v0, v1).unwrap();
+        assert_eq!(d.added, vec![5, 6]);
+        assert_eq!(d.removed, vec![2]);
+    }
+}
