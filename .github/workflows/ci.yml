@@ -42,6 +42,20 @@ jobs:
       # Cross-check the hand-written SIMD kernels against the simsimd reference.
       - run: cargo test -p vecvec-core --features oracle matches_simsimd
 
+  test-arm:
+    name: test (aarch64)
+    # The other jobs run on x86_64, so the aarch64 NEON kernels (selected on every
+    # Apple-silicon / ARMv8 machine — the primary deployment target) are otherwise
+    # never compiled or correctness-checked in CI. This job runs the core suite on ARM
+    # (covering distance::aarch64's NEON kernels) plus the simsimd parity check.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p vecvec-core
+      - run: cargo test -p vecvec-core --features oracle matches_simsimd
+
   bench:
     name: bench-compile
     runs-on: ubuntu-latest

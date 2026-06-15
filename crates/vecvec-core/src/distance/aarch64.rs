@@ -72,3 +72,44 @@ pub(crate) unsafe fn sq_l2_f32(a: &[f32], b: &[f32]) -> f32 {
     }
     sum
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vec_of(dim: usize, seed: u32) -> Vec<f32> {
+        (0..dim)
+            .map(|i| {
+                let x = (i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed);
+                ((x % 2000) as f32 / 1000.0) - 1.0
+            })
+            .collect()
+    }
+
+    /// The NEON kernels run on every Apple-silicon / ARMv8 machine but are never
+    /// compiled by the x86-only CI runners, so validate them in-file here. Covers the
+    /// 16-wide main loop plus every tail remainder 0..16 (and a few large dims), each
+    /// asserted equal to the scalar reference within fp tolerance.
+    #[test]
+    fn neon_matches_scalar_across_dims() {
+        // 1..=15 are pure-tail (no full 16-chunk); 16..=33 give a full chunk with
+        // every tail remainder 0..15; the rest stress multiple chunks + long tails.
+        let dims = (1usize..=33).chain([48, 64, 96, 127, 128, 256, 769]);
+        for dim in dims {
+            let a = vec_of(dim, 11);
+            let b = vec_of(dim, 13);
+            // SAFETY: neon is baseline on aarch64; this file only compiles there.
+            let (n_dot, n_l2) = unsafe { (dot_f32(&a, &b), sq_l2_f32(&a, &b)) };
+            let s_dot = super::super::scalar::dot_f32(&a, &b);
+            let s_l2 = super::super::scalar::sq_l2_f32(&a, &b);
+            assert!(
+                (n_dot - s_dot).abs() < 1e-3,
+                "neon dot dim {dim}: {n_dot} vs {s_dot}"
+            );
+            assert!(
+                (n_l2 - s_l2).abs() < 1e-3,
+                "neon sq_l2 dim {dim}: {n_l2} vs {s_l2}"
+            );
+        }
+    }
+}

@@ -231,4 +231,95 @@ mod tests {
             .matches(99)
         );
     }
+
+    #[test]
+    fn match_int_vs_float_equality() {
+        // `Condition::eval` does a raw serde_json `Value` comparison, and serde_json
+        // treats Number(3) and Number(3.0) as DISTINCT. So `match` is type-sensitive:
+        // an int filter only matches an int-stored value (and float only float).
+        // Crossing the types silently drops every result — pin that contract here.
+        let int_stored = payload(json!({ "n": 3 }));
+        let float_stored = payload(json!({ "n": 3.0 }));
+
+        let cond = |val: serde_json::Value| Filter {
+            must: vec![Condition {
+                key: "n".into(),
+                r#match: Some(val),
+                range: None,
+            }],
+            ..Default::default()
+        };
+        let matches = |f: &Filter, p: &PayloadMap| {
+            FilterQuery {
+                filter: f,
+                payloads: p,
+            }
+            .matches(1)
+        };
+
+        // Same type on both sides matches.
+        assert!(matches(&cond(json!(3)), &int_stored));
+        assert!(matches(&cond(json!(3.0)), &float_stored));
+        // Crossing int/float does NOT match (documents the typing footgun).
+        assert!(!matches(&cond(json!(3.0)), &int_stored));
+        assert!(!matches(&cond(json!(3)), &float_stored));
+    }
+
+    #[test]
+    fn must_not_does_not_exclude_missing_field() {
+        // A missing field reads as `None`, so a `match` on an absent field is false,
+        // and `must_not` over a false condition does NOT exclude the point. (must_not
+        // is true negation, not a presence filter.)
+        let payloads = payload(json!({ "tag": "b" }));
+        let f = Filter {
+            must_not: vec![Condition {
+                key: "other".into(),
+                r#match: Some(json!("x")),
+                range: None,
+            }],
+            ..Default::default()
+        };
+        // Point lacks "other" -> must_not doesn't fire -> passes.
+        assert!(
+            FilterQuery {
+                filter: &f,
+                payloads: &payloads
+            }
+            .matches(1)
+        );
+        // A point with no payload at all also passes a pure must_not filter.
+        assert!(
+            FilterQuery {
+                filter: &f,
+                payloads: &payloads
+            }
+            .matches(99)
+        );
+
+        // must + must_not + should evaluated together on one payload, all satisfied.
+        let combined = Filter {
+            must: vec![Condition {
+                key: "tag".into(),
+                r#match: Some(json!("b")),
+                range: None,
+            }],
+            should: vec![Condition {
+                key: "tag".into(),
+                r#match: Some(json!("b")),
+                range: None,
+            }],
+            must_not: vec![Condition {
+                key: "missing".into(),
+                r#match: Some(json!("z")),
+                range: None,
+            }],
+        };
+        assert!(
+            FilterQuery {
+                filter: &combined,
+                payloads: &payloads
+            }
+            .matches(1)
+        );
+    }
 }

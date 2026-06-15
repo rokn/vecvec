@@ -229,4 +229,39 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn ties_broken_by_ascending_id() {
+        // Several identical vectors => identical scores. The `(badness, id)` rank key
+        // must break ties by ascending id, deterministically and identically in both
+        // BoundedTopK (flat search) and the brute-force oracle — the property that
+        // lets the oracle validate approximate indexes.
+        let dim = 8;
+        let metric = Metric::Cosine; // normalized => the tie group scores exactly 1.0
+        let mut s = VectorStorage::with_capacity(dim, metric, 20);
+        let tied = vec_of(dim, 1);
+        for _ in 0..10 {
+            s.push(&tied); // ids 0..10 share one vector (a 10-way score tie)
+        }
+        for i in 10..20 {
+            s.push(&vec_of(dim, 1000 + i)); // distinct, lower-scoring
+        }
+        let storage = Arc::new(s);
+        let flat = FlatIndex::new(storage.clone());
+
+        // Query == the tied vector: the 10 identical points all score highest (cosine
+        // 1.0) and tie. With k < the tie-group size, the smallest ids must win, in
+        // ascending order.
+        let got = flat.search(&tied, 4, SearchParams::default(), None);
+        let ids: Vec<u32> = got.iter().map(|sp| sp.id.get()).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1, 2, 3],
+            "ties must resolve to the smallest ids in order"
+        );
+
+        // And it matches the oracle exactly (ids and scores).
+        let want = brute_force_topk(&storage, flat.kernel(), &tied, 4, None, None);
+        assert_eq!(got, want);
+    }
 }

@@ -204,4 +204,22 @@ mod tests {
         let mut s = VectorStorage::new(3, Metric::Dot);
         s.push(&[1.0, 2.0]);
     }
+
+    #[test]
+    fn cosine_zero_vector_push_is_stored_as_zero() {
+        // `l2_normalize` leaves a zero vector unchanged (norm 0), so a zero vector
+        // pushed into a Cosine store is stored NON-normalized — it violates the unit
+        // invariant the module promises. Document and lock the current behavior.
+        let mut s = VectorStorage::new(2, Metric::Cosine);
+        let id = s.push(&[0.0, 0.0]);
+        assert_eq!(s.get(id), &[0.0, 0.0]);
+        assert_eq!(distance::l2_norm(s.get(id)), 0.0);
+
+        // A non-finite component normalizes to NaN: norm == inf, inv == 1/inf == 0,
+        // and inf * 0 == NaN (1.0 * 0 == 0). Documents this edge as it stands.
+        let nf = s.push(&[f32::INFINITY, 1.0]);
+        let stored = s.get(nf);
+        assert!(stored[0].is_nan());
+        assert_eq!(stored[1], 0.0);
+    }
 }

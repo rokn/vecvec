@@ -1003,4 +1003,137 @@ mod tests {
             23
         );
     }
+
+    #[test]
+    fn diff_after_compact_over_deletes_is_exact() {
+        // Compaction merges the working segments; deletions stay collection-level. The
+        // range-based `live_ids` reconstruction must still report the SAME live set
+        // before and after compaction even with interior ids deleted — i.e. it must
+        // not resurrect the deleted interior ids as phantom adds.
+        let dim = 8;
+        let col = Collection::create(config(dim));
+        let ids1 = col
+            .insert_batch(&(0..15).map(|i| vec_of(dim, i + 1)).collect::<Vec<_>>())
+            .unwrap();
+        col.seal();
+        let ids2 = col
+            .insert_batch(&(0..15).map(|i| vec_of(dim, 100 + i)).collect::<Vec<_>>())
+            .unwrap();
+        col.seal();
+        assert_eq!(col.sealed_count(), 2);
+
+        // Delete every other id (interior deletions inside both segment ranges).
+        let all_ids: Vec<GlobalId> = ids1.iter().chain(&ids2).copied().collect();
+        for (i, &id) in all_ids.iter().enumerate() {
+            if i % 2 == 0 {
+                assert!(col.delete(id));
+            }
+        }
+        assert_eq!(col.len(), 15);
+        let v_prev = col.commit("manual", None, None).unwrap();
+
+        // Compact the two segments into one (its global-id range spans [min,max],
+        // including the deleted interior ids), then commit.
+        assert!(col.compact().is_some());
+        assert_eq!(col.sealed_count(), 1);
+        let v_c = col.commit("manual", None, None).unwrap();
+
+        // Same live set across the compaction boundary: no phantom adds/removes.
+        let d = col.diff(v_prev, v_c).unwrap();
+        assert!(
+            d.added.is_empty(),
+            "phantom adds after compact-over-deletes: {:?}",
+            d.added
+        );
+        assert!(
+            d.removed.is_empty(),
+            "phantom removes after compact-over-deletes: {:?}",
+            d.removed
+        );
+        assert_eq!(col.len(), 15);
+    }
+
+    #[test]
+    fn gc_never_drops_live_working_segment() {
+        // After a restore re-points the working set at an OLD segment, GC must never
+        // drop that live working segment (live search depends on it), even while
+        // dropping the versions that introduced the now-unused segments.
+        let dim = 8;
+        let col = Collection::create(config(dim));
+        // v0 references segA.
+        col.insert_batch(&(0..20).map(|i| vec_of(dim, i + 1)).collect::<Vec<_>>())
+            .unwrap();
+        let v0 = col.commit("manual", None, None).unwrap();
+        let seg_a = col.working_segment_ids();
+        assert_eq!(seg_a.len(), 1);
+
+        // v1 adds new data: working set becomes {segA, segB}.
+        col.insert_batch(&(0..20).map(|i| vec_of(dim, 100 + i)).collect::<Vec<_>>())
+            .unwrap();
+        col.commit("manual", None, None).unwrap();
+        assert_eq!(col.sealed_count(), 2);
+
+        // Restore to v0: working re-points back at segA alone.
+        col.restore(v0).unwrap();
+        assert_eq!(col.working_segment_ids(), seg_a);
+
+        // GC keeping only the latest version. segA is the live working set: it must
+        // survive even though the older versions referencing it are dropped.
+        let dropped = col.gc(&RetentionRules {
+            keep_last: Some(1),
+            ..Default::default()
+        });
+        assert!(
+            !dropped.contains(&SegmentId::new(seg_a[0])),
+            "GC dropped the live working segment {}",
+            seg_a[0]
+        );
+        // Live search still returns segA's points after GC.
+        assert_eq!(col.len(), 20);
+        assert_eq!(col.search(&vec_of(dim, 1), 10, None).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn recommend_with_negatives_steers_toward_positive_cluster() {
+        // Exercises the mean(positives) - mean(negatives) construction with a real
+        // negative example, plus the negatives-only (np==0, nn>0) path. A sign error
+        // or wrong divisor in the negative term would steer the query the wrong way.
+        let dim = 8;
+        let col = Collection::create(CollectionConfig::new("c", dim, Metric::Cosine));
+        // Cluster A near the +x axis, cluster B near the +y axis (orthogonal).
+        let mut a_ids = Vec::new();
+        let mut b_ids = Vec::new();
+        for i in 0..15 {
+            let mut a = vec![0.0f32; dim];
+            a[0] = 1.0;
+            a[2] = 0.01 * i as f32; // tiny jitter, stays near the A axis
+            a_ids.push(col.insert(&a).unwrap());
+        }
+        for i in 0..15 {
+            let mut b = vec![0.0f32; dim];
+            b[1] = 1.0;
+            b[3] = 0.01 * i as f32;
+            b_ids.push(col.insert(&b).unwrap());
+        }
+        let a_set: HashSet<u64> = a_ids.iter().map(|g| g.get()).collect();
+
+        // positive A, negative B: query mean(A) - mean(B) points toward cluster A.
+        let got = col.recommend(&[a_ids[0]], &[b_ids[0]], 5, None).unwrap();
+        assert_eq!(got.len(), 5);
+        assert!(
+            got.iter().all(|s| a_set.contains(&s.id.get())),
+            "negative steering should keep results in cluster A, got {:?}",
+            got.iter().map(|s| s.id.get()).collect::<Vec<_>>()
+        );
+        assert!(got.iter().all(|s| s.id != b_ids[0]));
+
+        // Negatives-only path (np==0, nn>0): query = -mean(B), steering away from B
+        // toward cluster A. Must succeed and exclude nothing (no positives).
+        let neg_only = col.recommend(&[], &[b_ids[0]], 5, None).unwrap();
+        assert_eq!(neg_only.len(), 5);
+        assert!(
+            neg_only.iter().all(|s| a_set.contains(&s.id.get())),
+            "negatives-only should steer to cluster A (far side of B)"
+        );
+    }
 }

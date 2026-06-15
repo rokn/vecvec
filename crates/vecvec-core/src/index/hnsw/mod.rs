@@ -308,6 +308,7 @@ impl Index for HnswIndex {
 mod tests {
     use super::*;
     use crate::distance::Metric;
+    use crate::index::BitmapFilter;
     use crate::index::brute_force_topk;
 
     fn vec_of(dim: usize, seed: u32) -> Vec<f32> {
@@ -692,6 +693,151 @@ mod tests {
                     "metric={metric}: int8 recall {int8_recall:.3} < 0.95"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn concurrent_build_preserves_back_links() {
+        // The parallel builder MERGES a point's own links with concurrently-pushed
+        // reverse-links rather than overwriting them. HNSW wires edges both ways, so
+        // the layer-0 mutual-link ratio is the cheap proxy that back-links survived.
+        // Pruning legitimately breaks *some* symmetry, so rather than a fragile
+        // absolute we anchor to the SEQUENTIAL build (same merge, no races) as the
+        // baseline: an `*list = selected` overwrite regression — which only races
+        // under concurrency — would collapse the concurrent ratio well below it.
+        let dim = 24;
+        let n = 3_000;
+        let cfg = HnswConfig {
+            quantization: false,
+            ..HnswConfig::default()
+        };
+        let store = storage(dim, n, Metric::Cosine);
+
+        use super::search::Graph;
+        let mutual_ratio = |g: &GraphLayers| {
+            let (mut total, mut mutual) = (0usize, 0usize);
+            for p in 0..n as u32 {
+                for &q in g.neighbors(p, 0) {
+                    total += 1;
+                    if g.neighbors(q, 0).contains(&p) {
+                        mutual += 1;
+                    }
+                }
+            }
+            mutual as f32 / total.max(1) as f32
+        };
+
+        let seq = HnswIndex::build(store.clone(), cfg);
+        let par = HnswIndex::build_concurrent(store, cfg);
+        assert_valid_graph(&par, n);
+        let seq_ratio = mutual_ratio(seq.graph());
+        let par_ratio = mutual_ratio(par.graph());
+
+        assert!(
+            seq_ratio >= 0.5,
+            "sanity: sequential mutual-link ratio {seq_ratio:.3} unexpectedly low"
+        );
+        assert!(
+            par_ratio >= seq_ratio - 0.12,
+            "concurrent mutual-link ratio {par_ratio:.3} materially below sequential \
+             {seq_ratio:.3} — back-links being dropped (overwrite instead of merge)?"
+        );
+    }
+
+    #[test]
+    fn filtered_search_traverses_rejected_nodes_for_connectivity() {
+        // Filtered HNSW must keep TRAVERSING through rejected nodes (excluding them
+        // only from results), so matches reachable only by hopping through rejected
+        // nodes are still found. HnswIndex::search has no exact-scan fallback (that
+        // lives in SealedSegment), so this exercises the admit/traverse split directly:
+        // if `admit` pruned traversal, filtered recall would collapse.
+        let dim = 24;
+        let n = 1_000;
+        let metric = Metric::Cosine;
+        let store = storage(dim, n, metric);
+        let kernel = DistanceKernel::new(metric, dim);
+        let index = HnswIndex::build(store.clone(), HnswConfig::default());
+
+        // Admit a scattered ~5% of ids (only multiples of 20).
+        let filter =
+            BitmapFilter::from_ids((0..n as u32).filter(|i| i % 20 == 0).map(PointId::new));
+
+        let queries = 20;
+        let mut total = 0.0f32;
+        for q in 0..queries {
+            let query = vec_of(dim, 400_000 + q);
+            let got = index.search(&query, 10, SearchParams::default(), Some(&filter));
+            assert_eq!(got.len(), 10, "filtered search under-filled (q={q})");
+            assert!(
+                got.iter().all(|s| s.id.get() % 20 == 0),
+                "filtered search returned a rejected id"
+            );
+            let truth = brute_force_topk(&store, &kernel, &query, 10, None, Some(&filter));
+            total += recall_at(&got, &truth);
+        }
+        let recall = total / queries as f32;
+        assert!(
+            recall >= 0.9,
+            "filtered recall {recall:.3} < 0.9 — admit may be pruning traversal"
+        );
+    }
+
+    #[test]
+    fn quantized_search_returns_exact_rescored_topk() {
+        // The quantized path over-fetches by int8 badness then rescores with the exact
+        // f32 kernel. Assert the rescore actually (a) attaches the TRUE f32 score (not
+        // leftover quantized badness), (b) orders best-first with the correct sign per
+        // metric, and (c) for queries the graph nails (recall 1.0) returns exactly the
+        // exact top-10 ids in exact order. A wrong rescore sort key would break (b)/(c)
+        // and a missing rescore would break (a) — none caught by set-membership recall.
+        let dim = 24;
+        let n = 2_000;
+        let queries = 50;
+        for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
+            let store = storage(dim, n, metric);
+            let kernel = DistanceKernel::new(metric, dim);
+            let index = HnswIndex::build(store.clone(), HnswConfig::default()); // quantization on
+            let higher = metric.higher_is_better();
+
+            let mut exact_hits = 0;
+            for q in 0..queries {
+                let query = vec_of(dim, 500_000 + q);
+                let got = index.search(&query, 10, SearchParams::default(), None);
+                assert_eq!(got.len(), 10);
+
+                // (a) Each attached score is the exact f32 score of that point.
+                for sp in &got {
+                    let exact = kernel.score_f32(&query, store.get(sp.id));
+                    assert!(
+                        (sp.score - exact).abs() < 1e-4,
+                        "metric={metric}: attached score {} != exact f32 score {exact}",
+                        sp.score
+                    );
+                }
+                // (b) Ordered best-first by exact score with the correct polarity.
+                for w in got.windows(2) {
+                    if higher {
+                        assert!(w[0].score >= w[1].score - 1e-6, "metric={metric}: not desc");
+                    } else {
+                        assert!(w[0].score <= w[1].score + 1e-6, "metric={metric}: not asc");
+                    }
+                }
+                // (c) When the graph nails it, ids+order match the exact truth.
+                let truth = brute_force_topk(&store, &kernel, &query, 10, None, None);
+                if recall_at(&got, &truth) == 1.0 {
+                    let got_ids: Vec<u32> = got.iter().map(|s| s.id.get()).collect();
+                    let truth_ids: Vec<u32> = truth.iter().map(|s| s.id.get()).collect();
+                    assert_eq!(
+                        got_ids, truth_ids,
+                        "metric={metric}: rescored order != exact"
+                    );
+                    exact_hits += 1;
+                }
+            }
+            assert!(
+                exact_hits > 0,
+                "metric={metric}: no query hit recall 1.0; cannot verify exact order"
+            );
         }
     }
 }

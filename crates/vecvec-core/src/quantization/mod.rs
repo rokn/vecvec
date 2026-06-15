@@ -308,4 +308,60 @@ mod tests {
         };
         assert!(recall_for(8) >= recall_for(1));
     }
+
+    #[test]
+    fn encode_clamps_rounds_and_is_symmetric() {
+        // Fit on a store whose max abs is a known value (12.7) so scale is checkable.
+        let dim = 4;
+        let mut storage = VectorStorage::new(dim, Metric::Dot);
+        storage.push(&[12.7, -5.0, 0.0, 1.0]); // max abs = 12.7
+        storage.push(&[3.0, -2.0, 6.35, -1.0]);
+        let q = ScalarQuantizer::fit(&storage);
+        assert!(
+            (q.scale() - 12.7 / 127.0).abs() < 1e-6,
+            "scale must be max|value|/127, got {}",
+            q.scale()
+        );
+
+        // The max-magnitude value encodes to exactly +/-127 (not an i8-cast overflow).
+        assert_eq!(q.encode(&[12.7, 0.0, 0.0, 0.0])[0], 127);
+        assert_eq!(q.encode(&[-12.7, 0.0, 0.0, 0.0])[0], -127);
+
+        // A value far beyond the fitted max saturates via clamp (no `as i8` wrap:
+        // 1e9 would wrap to a small/negative number without the clamp).
+        assert_eq!(q.encode(&[1e9, 0.0, 0.0, 0.0])[0], 127);
+        assert_eq!(q.encode(&[-1e9, 0.0, 0.0, 0.0])[0], -127);
+
+        // Symmetric, zero-offset scheme: encode(v) == -encode(-v) componentwise.
+        for seed in [1u32, 2, 3] {
+            let v = vec_of(dim, seed);
+            let pos = q.encode(&v);
+            let neg = q.encode(&v.iter().map(|x| -x).collect::<Vec<_>>());
+            for (i, (p, n)) in pos.iter().zip(&neg).enumerate() {
+                assert_eq!(*p, -*n, "encode not symmetric at seed {seed} component {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn fit_all_zero_storage_yields_unit_scale() {
+        // The single guard against 1.0/0.0 = +inf inv (which would turn every code
+        // into NaN-as-i8 / garbage): an all-zero store forces scale to 1.0.
+        let dim = 4;
+        let mut storage = VectorStorage::new(dim, Metric::Dot);
+        for _ in 0..8 {
+            storage.push(&[0.0; 4]);
+        }
+        let q = ScalarQuantizer::fit(&storage);
+        assert_eq!(q.scale(), 1.0, "all-zero store must force scale to 1.0");
+        assert_eq!(q.encode(&[0.0; 4]), vec![0i8; 4]);
+
+        // An all-zero query against a quantizer fitted on normal (nonzero) data also
+        // encodes to all zeros.
+        let mut nonzero = VectorStorage::new(dim, Metric::Dot);
+        nonzero.push(&[1.0, -2.0, 3.0, 0.5]);
+        let q2 = ScalarQuantizer::fit(&nonzero);
+        assert!(q2.scale() > 0.0);
+        assert_eq!(q2.encode(&[0.0; 4]), vec![0i8; 4]);
+    }
 }

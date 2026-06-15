@@ -291,6 +291,54 @@ mod tests {
         assert!(z.iter().all(|&x| x == 0.0));
     }
 
+    /// Exercises the SIMD kernels *directly* (not via `dispatch::select`), so a CI
+    /// runner that happens to lack AVX2+FMA can't silently leave them unvalidated the
+    /// way `matches_simsimd_oracle` (which routes through dispatch) would. On any
+    /// target where the SIMD feature is detected, the SIMD kernel must equal scalar.
+    #[test]
+    fn simd_kernels_match_scalar_directly() {
+        for &dim in DIMS {
+            let a = vec_of(dim, 21);
+            let b = vec_of(dim, 22);
+            let s_dot = super::scalar::dot_f32(&a, &b);
+            let s_l2 = super::scalar::sq_l2_f32(&a, &b);
+
+            #[cfg(target_arch = "x86_64")]
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                // SAFETY: avx2 + fma detected just above.
+                let (d, l) =
+                    unsafe { (super::x86::dot_f32(&a, &b), super::x86::sq_l2_f32(&a, &b)) };
+                assert!(
+                    (d - s_dot).abs() < 1e-3,
+                    "x86 dot dim {dim}: {d} vs {s_dot}"
+                );
+                assert!(
+                    (l - s_l2).abs() < 1e-3,
+                    "x86 sq_l2 dim {dim}: {l} vs {s_l2}"
+                );
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("neon") {
+                // SAFETY: neon detected just above (baseline on aarch64).
+                let (d, l) = unsafe {
+                    (
+                        super::aarch64::dot_f32(&a, &b),
+                        super::aarch64::sq_l2_f32(&a, &b),
+                    )
+                };
+                assert!(
+                    (d - s_dot).abs() < 1e-3,
+                    "neon dot dim {dim}: {d} vs {s_dot}"
+                );
+                assert!(
+                    (l - s_l2).abs() < 1e-3,
+                    "neon sq_l2 dim {dim}: {l} vs {s_l2}"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "oracle")]
     #[test]
     fn matches_simsimd_oracle() {

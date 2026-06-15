@@ -201,4 +201,31 @@ mod tests {
         let decoded = decode_segment(SegmentId::new(1), &bytes).unwrap();
         assert!(decoded.index().config().quantization);
     }
+
+    /// The serialized `deleted` tombstone vector must round-trip: an index carrying
+    /// internal tombstones must decode with exactly the same tombstoned/live ids and
+    /// live count, otherwise a reload would resurrect deleted points or hide live ones.
+    #[test]
+    fn codec_roundtrip_preserves_internal_tombstones() {
+        use crate::id::PointId;
+        use crate::index::Index;
+
+        let seg = build_sealed(true);
+        let live_before = seg.index().live_len();
+
+        // Tombstone a couple of local ids on the index before encoding.
+        assert!(seg.index().delete(PointId::new(2)));
+        assert!(seg.index().delete(PointId::new(7)));
+        assert_eq!(seg.index().live_len(), live_before - 2);
+
+        let bytes = encode_segment(&seg).unwrap();
+        let decoded = decode_segment(SegmentId::new(1), &bytes).unwrap();
+
+        // The decoded index re-applies exactly those tombstones (and no others).
+        assert!(decoded.index().is_deleted(PointId::new(2)));
+        assert!(decoded.index().is_deleted(PointId::new(7)));
+        assert!(!decoded.index().is_deleted(PointId::new(0)));
+        assert!(!decoded.index().is_deleted(PointId::new(5)));
+        assert_eq!(decoded.index().live_len(), live_before - 2);
+    }
 }

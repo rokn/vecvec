@@ -193,4 +193,35 @@ mod tests {
         std::fs::write(&path, &raw).unwrap();
         assert!(store.load(SegmentId::new(2)).is_err());
     }
+
+    #[test]
+    fn load_rejects_future_format_version() {
+        // The forward-compatibility guard: a segment written by a newer binary (format
+        // version > what we support) must be rejected with a typed UnsupportedVersion
+        // error, not silently mis-decoded.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SegmentStore::new(dir.path());
+        let seg = build_sealed(8, 50, Metric::Dot, SegmentId::new(7));
+        // Write a structurally-valid frame (real payload + CRC) but stamp a format
+        // version one past the supported maximum.
+        let payload = encode_segment(&seg).unwrap();
+        write_atomic(
+            &dir.path().join("7.seg"),
+            FileKind::Segment,
+            SEGMENT_FORMAT_VERSION + 1,
+            &payload,
+        )
+        .unwrap();
+
+        match store.load(SegmentId::new(7)) {
+            Err(CoreError::UnsupportedVersion {
+                found, supported, ..
+            }) => {
+                assert_eq!(found, SEGMENT_FORMAT_VERSION + 1);
+                assert_eq!(supported, SEGMENT_FORMAT_VERSION);
+            }
+            Err(other) => panic!("expected UnsupportedVersion, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedVersion, but load succeeded"),
+        }
+    }
 }
