@@ -192,12 +192,14 @@ struct QueryReq {
     at: Option<AtReq>,
     #[serde(default)]
     filter: Option<vecvec_core::Filter>,
+    #[serde(default)]
+    include_payloads: bool,
 }
 
-fn results_json(results: Vec<(u64, f32)>) -> Response {
+fn results_json(results: Vec<(u64, f32, Option<serde_json::Value>)>) -> Response {
     let results: Vec<_> = results
         .into_iter()
-        .map(|(id, score)| json!({ "id": id, "score": score }))
+        .map(|(id, score, payload)| json!({ "id": id, "score": score, "payload": payload }))
         .collect();
     Json(json!({ "results": results })).into_response()
 }
@@ -208,7 +210,10 @@ async fn query(
     Json(req): Json<QueryReq>,
 ) -> Response {
     let at = req.at.and_then(AtReq::selector);
-    match svc.query(name, req.vector, req.k, at, req.filter).await {
+    match svc
+        .query(name, req.vector, req.k, at, req.filter, req.include_payloads)
+        .await
+    {
         Ok(results) => results_json(results),
         Err(e) => err(e),
     }
@@ -223,6 +228,8 @@ struct RecommendReq {
     k: usize,
     #[serde(default)]
     filter: Option<vecvec_core::Filter>,
+    #[serde(default)]
+    include_payloads: bool,
 }
 
 async fn recommend(
@@ -231,7 +238,14 @@ async fn recommend(
     Json(req): Json<RecommendReq>,
 ) -> Response {
     match svc
-        .recommend(name, req.positive, req.negative, req.k, req.filter)
+        .recommend(
+            name,
+            req.positive,
+            req.negative,
+            req.k,
+            req.filter,
+            req.include_payloads,
+        )
         .await
     {
         Ok(results) => results_json(results),

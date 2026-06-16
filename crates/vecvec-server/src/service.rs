@@ -15,6 +15,7 @@ use vecvec_core::durable::read_config;
 use vecvec_core::version::{Manifest, VersionSelector};
 use vecvec_core::{
     CollectionConfig, CompactionPolicy, DurableCollection, Filter, FsyncMode, Metric, Payload,
+    ScoredGlobal,
 };
 
 use crate::blocking::{BlockingBridge, BridgeError};
@@ -201,19 +202,27 @@ impl Service {
         k: usize,
         at: Option<VersionSelector>,
         filter: Option<Filter>,
-    ) -> Result<Vec<(u64, f32)>, ServiceError> {
+        include_payloads: bool,
+    ) -> Result<Vec<(u64, f32, Option<Payload>)>, ServiceError> {
         let durable = self
             .registry
             .get(&collection)
             .ok_or(ServiceError::NotFound(collection))?;
         let results = self
             .bridge
-            .run(move || match at {
-                Some(selector) => durable.search_at(&selector, &query, k, filter.as_ref()),
-                None => durable.search(&query, k, filter.as_ref()),
+            .run(move || {
+                let results = match at {
+                    Some(selector) => durable.search_at(&selector, &query, k, filter.as_ref()),
+                    None => durable.search(&query, k, filter.as_ref()),
+                }?;
+                Ok::<_, vecvec_core::CoreError>(scored_with_payloads(
+                    &durable,
+                    results,
+                    include_payloads,
+                ))
             })
             .await??;
-        Ok(results.into_iter().map(|s| (s.id.get(), s.score)).collect())
+        Ok(results)
     }
 
     /// Recommend-by-example over positive/negative point ids.
@@ -224,7 +233,8 @@ impl Service {
         negative: Vec<u64>,
         k: usize,
         filter: Option<Filter>,
-    ) -> Result<Vec<(u64, f32)>, ServiceError> {
+        include_payloads: bool,
+    ) -> Result<Vec<(u64, f32, Option<Payload>)>, ServiceError> {
         let durable = self.get(&collection)?;
         let results = self
             .bridge
@@ -237,10 +247,15 @@ impl Service {
                     .into_iter()
                     .map(vecvec_core::GlobalId::new)
                     .collect();
-                durable.recommend(&pos, &neg, k, filter.as_ref())
+                let results = durable.recommend(&pos, &neg, k, filter.as_ref())?;
+                Ok::<_, vecvec_core::CoreError>(scored_with_payloads(
+                    &durable,
+                    results,
+                    include_payloads,
+                ))
             })
             .await??;
-        Ok(results.into_iter().map(|s| (s.id.get(), s.score)).collect())
+        Ok(results)
     }
 
     fn get(&self, collection: &str) -> Result<StdArc<DurableCollection>, ServiceError> {
@@ -397,4 +412,25 @@ impl Service {
         let durable = self.get(&collection)?;
         Ok(self.bridge.run(move || durable.delete(id)).await??)
     }
+}
+
+/// Flattens scored hits to `(id, score, payload)` tuples, looking up each point's
+/// payload only when `include_payloads` is set (otherwise the payload is `None`).
+/// Runs inside the blocking bridge so the payload reads stay off the async reactor.
+fn scored_with_payloads(
+    durable: &DurableCollection,
+    results: Vec<ScoredGlobal>,
+    include_payloads: bool,
+) -> Vec<(u64, f32, Option<Payload>)> {
+    results
+        .into_iter()
+        .map(|s| {
+            let payload = if include_payloads {
+                durable.payload(s.id)
+            } else {
+                None
+            };
+            (s.id.get(), s.score, payload)
+        })
+        .collect()
 }

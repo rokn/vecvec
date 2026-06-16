@@ -448,6 +448,11 @@ impl DurableCollection {
         self.collection.recommend(positive, negative, k, filter)
     }
 
+    /// The JSON payload for a single point by id, or `None` if it has none.
+    pub fn payload(&self, id: GlobalId) -> Option<Payload> {
+        self.collection.payload(id)
+    }
+
     /// Diffs two versions.
     pub fn diff(&self, from: u64, to: u64) -> Result<crate::version::Diff> {
         self.collection.diff(from, to)
