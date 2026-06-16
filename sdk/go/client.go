@@ -23,7 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pb "gitea.mindov.casa/rokn/vecvec/sdk/go/gen/vecvec/v1"
+	pb "github.com/rokn/vecvec/sdk/go/gen/vecvec/v1"
 )
 
 // Metric is the distance metric a collection ranks by.

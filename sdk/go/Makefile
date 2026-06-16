@@ -1,6 +1,6 @@
 PROTO_DIR := ../../crates/vecvec-proto/proto
 PROTO := vecvec.proto
-GEN_MODULE := gitea.mindov.casa/rokn/vecvec/sdk/go/gen
+GEN_MODULE := github.com/rokn/vecvec/sdk/go/gen
 
 .PHONY: generate build
 

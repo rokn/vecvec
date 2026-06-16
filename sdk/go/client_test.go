@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	vecvec "gitea.mindov.casa/rokn/vecvec/sdk/go"
+	vecvec "github.com/rokn/vecvec/sdk/go"
 )
 
 // serverBinary returns the path to a built vecvec-server, or "" if absent.

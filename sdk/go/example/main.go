@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"log"
 
-	vecvec "gitea.mindov.casa/rokn/vecvec/sdk/go"
+	vecvec "github.com/rokn/vecvec/sdk/go"
 )
 
 func main() {
