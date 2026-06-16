@@ -5,11 +5,6 @@ versioning** of collections (immutable snapshots, time-travel query, branch, dif
 restore) on top of an HNSW index. See [BuildPlan.md](./BuildPlan.md) for the full
 architecture and milestone roadmap.
 
-> Status: **M0–M14 complete.** A durable, versioned vector database server with
-> from-scratch HNSW (int8-quantized + SIMD), WAL crash-recovery, git-like
-> versioning (time-travel/branch/diff/restore), payload filtering, recommend,
-> compaction/GC, a gRPC **and** REST API, and a CLI.
-
 ```sh
 cargo run -p vecvec-server          # gRPC :6334 + REST :6333
 grpcurl -plaintext 127.0.0.1:6334 list
