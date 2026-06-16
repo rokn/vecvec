@@ -104,11 +104,15 @@ message QueryRequest {
   optional VersionRef at = 4;
   // Optional JSON filter (must/should/must_not over field conditions).
   optional string filter = 5;
+  // Include payloads in the response.
+  bool include_payloads = 6;
 }
 
 message ScoredPoint {
   uint64 id = 1;
   float score = 2;
+  // The optional payload for the matched point if requested in QueryRequest.
+  optional string payload = 3;
 }
 
 message QueryResponse {
@@ -121,6 +125,8 @@ message RecommendRequest {
   repeated uint64 negative = 3;
   uint32 k = 4;
   optional string filter = 5;
+  // Include payloads in the response.
+  bool include_payloads = 6;
 }
 
 service Query {

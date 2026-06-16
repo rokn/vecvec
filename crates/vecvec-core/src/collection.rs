@@ -446,6 +446,11 @@ impl Collection {
         })
     }
 
+    /// The JSON payload for a single point by id, or `None` if it has none.
+    pub fn payload(&self, global: GlobalId) -> Option<Payload> {
+        self.payloads.read().get(&global.get()).cloned()
+    }
+
     /// Materializes a page of live points — every row across the working sealed set
     /// and the appendable segment, minus tombstones, joined with payloads and ordered
     /// by ascending global id. With `at`, reads as of a past version (its frozen

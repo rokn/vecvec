@@ -125,6 +125,7 @@ async fn create_upsert_query_over_grpc() {
             k: 10,
             at: None,
             filter: None,
+            include_payloads: false,
         })
         .await
         .unwrap()
@@ -300,6 +301,7 @@ async fn errors_map_to_grpc_status_codes() {
             k: 5,
             at: None,
             filter: None,
+            include_payloads: false,
         })
         .await
         .unwrap_err();
@@ -313,6 +315,7 @@ async fn errors_map_to_grpc_status_codes() {
             k: 5,
             at: None,
             filter: None,
+            include_payloads: false,
         })
         .await
         .unwrap_err();
@@ -364,6 +367,7 @@ async fn filtered_query_over_grpc() {
             k: 10,
             at: None,
             filter: Some(r#"{"must":[{"key":"bucket","match":2}]}"#.into()),
+            include_payloads: false,
         })
         .await
         .unwrap()
@@ -470,6 +474,7 @@ async fn versioning_over_grpc() {
                     k: 50,
                     at: at_ref,
                     filter: None,
+                    include_payloads: false,
                 })
                 .await
                 .unwrap()
@@ -514,6 +519,7 @@ async fn versioning_over_grpc() {
                 selector: Some(pb::version_ref::Selector::Tag("base".into())),
             }),
             filter: None,
+            include_payloads: false,
         })
         .await
         .unwrap()
@@ -590,6 +596,7 @@ async fn data_survives_server_restart() {
                 k: n as u32,
                 at: None,
                 filter: None,
+                include_payloads: false,
             })
             .await
             .unwrap()

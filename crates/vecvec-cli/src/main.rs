@@ -70,6 +70,9 @@ enum Command {
         vector: String,
         #[arg(long, default_value_t = 10)]
         k: u32,
+        /// Include each matched point's JSON payload in the output.
+        #[arg(long)]
+        include_payloads: bool,
     },
     /// Commit the working state as a new version.
     Commit {
@@ -219,6 +222,7 @@ async fn main() -> Result<(), BoxError> {
             collection,
             vector,
             k,
+            include_payloads,
         } => {
             let vector: Vec<f32> = vector
                 .split(',')
@@ -232,11 +236,15 @@ async fn main() -> Result<(), BoxError> {
                     k,
                     at: None,
                     filter: None,
+                    include_payloads,
                 })
                 .await?
                 .into_inner();
             for r in resp.results {
-                println!("{}\t{}", r.id, r.score);
+                match r.payload {
+                    Some(p) => println!("{}\t{}\t{}", r.id, r.score, p),
+                    None => println!("{}\t{}", r.id, r.score),
+                }
             }
         }
         Command::Commit {

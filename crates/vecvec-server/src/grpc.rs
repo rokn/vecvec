@@ -164,13 +164,17 @@ impl pb::query_server::Query for Api {
         };
         let results = self
             .svc
-            .query(req.collection, req.vector, req.k as usize, at, filter)
+            .query(req.collection, req.vector, req.k as usize, at, filter, req.include_payloads)
             .await
             .map_err(to_status)?;
         Ok(Response::new(pb::QueryResponse {
             results: results
                 .into_iter()
-                .map(|(id, score)| pb::ScoredPoint { id, score })
+                .map(|(id, score, payload)| pb::ScoredPoint { 
+                    id, 
+                    score,
+                    payload: payload.map(|p| serde_json::to_string(&p).unwrap_or_default()),
+                })
                 .collect(),
         }))
     }
@@ -195,13 +199,18 @@ impl pb::query_server::Query for Api {
                 req.negative,
                 req.k as usize,
                 filter,
+                req.include_payloads,
             )
             .await
             .map_err(to_status)?;
         Ok(Response::new(pb::QueryResponse {
             results: results
                 .into_iter()
-                .map(|(id, score)| pb::ScoredPoint { id, score })
+                .map(|(id, score, payload)| pb::ScoredPoint {
+                    id,
+                    score,
+                    payload: payload.map(|p| serde_json::to_string(&p).unwrap_or_default()),
+                })
                 .collect(),
         }))
     }
