@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+/.direnv
+result
+result-*
+/data
+*.vecvec-data
+vecvec-data
+.git
+.github
+.DS_Store
+demos
+# UI build inputs are needed, but not its local build artifacts.
+vvui/node_modules
+vvui/dist
+vvui/.vite

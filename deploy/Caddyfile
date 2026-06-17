@@ -1,0 +1,19 @@
+# Serves the vecvec // SCOPE UI and reverse-proxies its /api/* calls to the
+# vecvec REST gateway running in the same container. `handle_path` strips the
+# /api prefix, matching what the Vite dev proxy does.
+{
+	admin off
+	persist_config off
+}
+
+:8080 {
+	handle_path /api/* {
+		reverse_proxy 127.0.0.1:6333
+	}
+
+	handle {
+		root * /srv/ui
+		try_files {path} /index.html
+		file_server
+	}
+}
